@@ -1,0 +1,12 @@
+name = "spectra-relay"
+main = "cloud/cloud-relay-worker.js"
+compatibility_date = "2024-10-01"
+
+# 24/7 Background Cron Trigger (Runs every 3 minutes)
+[triggers]
+crons = ["*/3 * * * *"]
+
+# Your live personal KV Namespace binding
+[[kv_namespaces]]
+binding = "SPECTRA_KV"
+id = "708107f6d61442e1b25eed62783fc076"

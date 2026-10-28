@@ -1,0 +1,2970 @@
+/**
+ * Spectra - Universiti Malaya SPeCTRUM Companion
+ * Resilient DOM and RegEx parsing routines for SPeCTRUM markup
+ */
+
+// Helper to extract course code like WIX2002, WIA1001, KIE2004, GIG1004, etc.
+export function extractCourseCode(text) {
+  if (!text) return "UM";
+  const match = text.match(/\b([A-Z]{3,4}\s*\d{4}[A-Z]?)\b/i);
+  if (match) {
+    return match[1].replace(/\s+/g, "").toUpperCase();
+  }
+  // Fallback: search for acronyms or first two words
+  const clean = text.trim();
+  const words = clean.split(/\s+/);
+  if (words.length > 0 && words[0].length >= 4 && words[0].length <= 8) {
+    return words[0].toUpperCase();
+  }
+  return "UM";
+}
+
+// Clean Moodle instance names (Moodle appends " File", " Assignment", etc. to screen readers)
+export function cleanMoodleTitle(raw) {
+  if (!raw) return "";
+  return raw
+    .replace(/\s+(File|Assignment|URL|Folder|Quiz|Forum|Page|Book)\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Determine urgency level based on due date timestamp
+ * - Urgent: < 24 hours
+ * - This Week: < 7 days
+ * - Upcoming: >= 7 days
+ */
+export function calculateUrgency(timestamp) {
+  const now = Date.now();
+  const diffHours = (timestamp - now) / (1000 * 60 * 60);
+
+  if (diffHours <= 24 && diffHours > -48) {
+    return "urgent";
+  } else if (diffHours <= 168 && diffHours > 24) {
+    return "this_week";
+  } else {
+    return "upcoming";
+  }
+}
+
+/**
+ * Format relative remaining time (e.g. "5h 12m left", "Due in 3 days", or "Due today")
+ */
+export function formatTimeRemaining(timestamp) {
+  if (!timestamp || isNaN(timestamp)) {
+    return "Open submission (no deadline)";
+  }
+  const diffMs = timestamp - Date.now();
+  if (diffMs <= 0) {
+    const overdueHrs = Math.floor(Math.abs(diffMs) / (1000 * 60 * 60));
+    if (overdueHrs === 0) return "Due just now";
+    if (overdueHrs < 24) return `${overdueHrs}h overdue`;
+    const overdueDays = Math.floor(overdueHrs / 24);
+    return `${overdueDays}d overdue`;
+  }
+
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+
+  if (hours < 24) {
+    return `${hours}h ${minutes}m left`;
+  }
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  if (days === 1) {
+    return remainingHours > 0 ? `Due in 1 day (${remainingHours}h left)` : `Due in 1 day`;
+  }
+  if (days < 7) {
+    return remainingHours > 0 ? `Due in ${days} days (${remainingHours}h left)` : `Due in ${days} days`;
+  }
+  return `Due in ${days} days`;
+}
+
+/**
+ * Formats timestamp into an exact readable calendar string (e.g. "Fri, 31 Oct 2026, 11:59 PM")
+ */
+export function formatDueCalendarDate(timestamp, fallbackText = "") {
+  if (timestamp && !isNaN(Number(timestamp))) {
+    const d = new Date(Number(timestamp));
+    return d.toLocaleString("en-MY", {
+      weekday: "short",
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+  }
+  if (fallbackText && fallbackText !== "No due date" && fallbackText !== "View Dropbox") {
+    const parsed = parseMoodleDateString(fallbackText);
+    if (parsed) {
+      return formatDueCalendarDate(parsed);
+    }
+    return fallbackText;
+  }
+  return "No deadline specified";
+}
+
+export const MAX_OVERDUE_DAYS = 40;
+export const MAX_OVERDUE_MS = MAX_OVERDUE_DAYS * 24 * 60 * 60 * 1000; // 40 days in ms
+
+/**
+ * Checks if a submission is overdue by more than 40 days.
+ * Items overdue by > 40 days are hidden from the UI and background scans to reduce clutter.
+ */
+export function isOverdueMoreThan40Days(dueTimestamp, now = Date.now()) {
+  if (!dueTimestamp || isNaN(dueTimestamp)) return false;
+  return (now - Number(dueTimestamp)) > MAX_OVERDUE_MS;
+}
+
+// Backward-compatible alias
+export const isOverdueMoreThan100Days = isOverdueMoreThan40Days;
+
+/**
+ * Strict differentiator:
+ * Identifies whether an activity or calendar event represents an Attendance check-in / session,
+ * to ensure attendance is NEVER mixed into coursework submission due / dropboxes.
+ * Reads module types, URLs, and inspects titles carefully in English and Bahasa Melayu.
+ */
+export function isAttendanceActivity(item) {
+  if (!item) return false;
+
+  // 1. Explicit Moodle module types & event types
+  const type = String(item.type || item.modulename || "").toLowerCase().trim();
+  const eventType = String(item.eventtype || "").toLowerCase().trim();
+  if (type === "attendance" || eventType === "attendance") {
+    return true;
+  }
+
+  // 2. Target URL indicators
+  const url = String(item.url || item.action?.url || "").toLowerCase();
+  if (url.includes("/mod/attendance/") || url.includes("attendance.php")) {
+    return true;
+  }
+
+  // 3. Activity or Event title keywords
+  const rawTitle = String(item.title || item.name || "");
+  const title = rawTitle.toLowerCase().trim();
+  if (!title) return false;
+
+  // Safeguard: Check if this is an academic project or assignment ABOUT an attendance system/app,
+  // e.g. "Assignment 1: Smart Attendance Management System", "Project Attendance Tracker App"
+  const isProjectAboutAttendance =
+    /\b(?:system|sistem|software|app|application|aplikasi|tracker|tracking|database|proposal|casestudy|case\s+study|architecture|framework|development)\b/i.test(title) &&
+    /\b(?:assignment|project|projek|tugasan|homework|essay|report|laporan)\b/i.test(title);
+
+  if (isProjectAboutAttendance) {
+    return false;
+  }
+
+  // Comprehensive attendance indicators:
+  // English: attendance, attendence (typo), attandance, check-in, check in, checkin, sign-in, sign in, signin, presensi, roll call
+  // Bahasa Melayu: kehadiran, kedatangan, daftar kehadiran, rekod kehadiran, isi kehadiran, catat kehadiran, sahkan kehadiran
+  const attendancePatterns = [
+    // Direct presence keywords
+    /\b(?:attendance|attendence|attandance|kehadiran|kedatangan|presensi|absensi)\b/i,
+    // Check-in / Sign-in / Roll call
+    /\b(?:check[\s-]?in|sign[\s-]?in|roll[\s-]?call)\b/i,
+    // Action verbs + attendance/kehadiran
+    /\b(?:take|record|submit|mark|verify|confirm|log)\s+(?:your\s+)?attendance\b/i,
+    /\b(?:rekod|isi|hantar|catat|daftar|sahkan|tanda|ambil)\s+kehadiran\b/i,
+    // Contextual: Lecture / Tutorial / Lab / Class / Week attendance
+    /\b(?:lecture|tutorial|lab|class|weekly|daily|sesi|session|kuliah|makmal|kelas|mingguan)\s+(?:attendance|kehadiran|check[\s-]?in|sign[\s-]?in)\b/i,
+    /\b(?:attendance|kehadiran)\s+(?:for\s+)?(?:lecture|tutorial|lab|class|week|minggu|sesi|session|kuliah|makmal|kelas)\b/i,
+    // Attendance with group or occurrence
+    /\b(?:attendance|kehadiran)\s*[-–:]?\s*(?:occ|occurrence|group|kumpulan|tut|tutorial)\b/i,
+    // Attendance forms & QR
+    /\b(?:qr|form|borang)\s+(?:code\s+)?(?:attendance|kehadiran)\b/i,
+    /\b(?:attendance|kehadiran)\s+(?:qr|form|borang)\b/i
+  ];
+
+  for (const pattern of attendancePatterns) {
+    if (pattern.test(title)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Parses calendar deadlines from SPeCTRUM HTML or JSON
+ * Can accept raw HTML string from /calendar/view.php?view=upcoming
+ * or parsed JSON from core_calendar_get_action_events_by_timesort
+ */
+export function parseCalendarEvents(sourceData) {
+  if (!sourceData) return [];
+
+  // Case 1: Moodle AJAX JSON response
+  if (typeof sourceData === "object" && sourceData.events) {
+    return sourceData.events
+      .filter((evt) => !isAttendanceActivity(evt))
+      .filter((evt) => {
+        const timestamp = (evt.timesort || evt.timestart) * 1000;
+        return !isOverdueMoreThan40Days(timestamp);
+      })
+      .map((evt) => {
+        const timestamp = (evt.timesort || evt.timestart) * 1000;
+        const courseCode = extractCourseCode(evt.course?.shortname || evt.course?.fullname || "");
+        const eventUrl = evt.action?.url || (evt.url ? evt.url : `https://spectrum.um.edu.my/mod/${evt.modulename || "assign"}/view.php?id=${evt.instance || evt.id}`);
+
+        return {
+          id: String(evt.id),
+          title: cleanMoodleTitle(evt.name),
+          courseCode,
+          courseName: evt.course?.fullname || courseCode,
+          dueDate: new Date(timestamp).toISOString(),
+          dueTimestamp: timestamp,
+          formattedTime: evt.formattedtime || new Date(timestamp).toLocaleString("en-MY", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }),
+          url: eventUrl,
+          type: evt.modulename || "assign",
+          urgency: calculateUrgency(timestamp),
+          isCompleted: false
+        };
+      });
+  }
+
+  // Case 2: Raw HTML string parsing
+  if (typeof sourceData === "string") {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(sourceData, "text/html");
+    const events = [];
+
+    // Query calendar event containers
+    const eventCards = doc.querySelectorAll(".event, .calendar-event, [data-event-title], .card.event");
+
+    eventCards.forEach((card, idx) => {
+      try {
+        const titleEl = card.querySelector("[data-event-title], .name, .card-title, h3, h4, a[href*='mod/']");
+        const title = cleanMoodleTitle(titleEl ? titleEl.textContent : `Assignment ${idx + 1}`);
+
+        // Link
+        const linkEl = card.querySelector("a[href*='mod/assign'], a[href*='mod/quiz'], a[href*='mod/'], a.card-link");
+        let url = linkEl ? linkEl.getAttribute("href") : "https://spectrum.um.edu.my/calendar/view.php";
+        if (url && !url.startsWith("http")) {
+          url = "https://spectrum.um.edu.my/" + url.replace(/^\//, "");
+        }
+
+        // Course information
+        const courseEl = card.querySelector(".course, a[href*='course/view.php'], .card-footer, .text-muted");
+        const courseText = courseEl ? courseEl.textContent : "";
+        const courseCode = extractCourseCode(courseText || title);
+
+        // Date extraction
+        const dateEl = card.querySelector(".date, [data-region='event-date'], .col-11, .time");
+        const dateStr = dateEl ? dateEl.textContent.trim() : "";
+
+        // Rough date approximation from string or default to +2 days if unparseable
+        let timestamp = Date.now() + 2 * 86400 * 1000;
+        if (dateStr) {
+          const parsedTimestamp = parseMoodleDateString(dateStr);
+          if (parsedTimestamp) timestamp = parsedTimestamp;
+        }
+
+        // ID extraction
+        const eventId = card.getAttribute("data-event-id") || `parsed_event_${idx}_${Date.now()}`;
+        const type = url.includes("mod/quiz")
+          ? "quiz"
+          : url.includes("mod/workshop")
+            ? "workshop"
+            : url.includes("turnitintooltwo")
+              ? "turnitin"
+              : url.includes("mod/attendance")
+                ? "attendance"
+                : "assign";
+
+        // Exclude attendance from submissions
+        if (isAttendanceActivity({ url, title, type })) {
+          return;
+        }
+
+        // Exclude items overdue by more than 40 days
+        if (isOverdueMoreThan40Days(timestamp)) {
+          return;
+        }
+
+        events.push({
+          id: eventId,
+          title,
+          courseCode,
+          courseName: courseText ? courseText.trim() : courseCode,
+          dueDate: new Date(timestamp).toISOString(),
+          dueTimestamp: timestamp,
+          formattedTime: dateStr || new Date(timestamp).toLocaleString("en-MY", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }),
+          url,
+          type,
+          urgency: calculateUrgency(timestamp),
+          isCompleted: false
+        });
+      } catch (err) {
+        console.warn("Failed parsing individual event card:", err);
+      }
+    });
+
+    return events;
+  }
+
+  return [];
+}
+
+/**
+ * Resilient parser for Moodle date strings such as:
+ * "Monday, 20 October, 11:59 PM"
+ * "Today, 11:59 PM"
+ * "Tomorrow, 5:00 PM"
+ * "20 Oct 2026, 23:59"
+ */
+export function parseMoodleDateString(dateStr) {
+  if (!dateStr) return null;
+  const now = new Date();
+  const raw = String(dateStr).replace(/\u00a0/g, " ").trim();
+
+  // Strip common Moodle prefix labels like "Closed date:", "Close date:", "Quiz closes:", "Cut-off date:", "Due date:", "Tarikh tutup:", etc.
+  const stripped = raw.replace(
+    /^(?:this\s+quiz\s+(?:will\s+)?closes?(?:\s+on)?|this\s+assignment\s+is\s+closed(?:\s+on)?|quiz\s+closes|closes?|closed(?:\s+on)?|closed?\s*date|close\s*date|due\s*date|due|cut-?off\s*date|cutoff\s*date|tarikh\s*(?:tutup|akhir)|ditutup\s*(?:pada)?)[\s:]*/i,
+    ""
+  ).trim();
+
+  const lower = stripped.toLowerCase();
+
+  // If text indicates no due date
+  if (lower.includes("no due date") || lower.includes("tiada tarikh akhir") || stripped === "-" || !stripped) {
+    return null;
+  }
+
+  // Extract time if present
+  let hours = 23;
+  let minutes = 59;
+  const timeMatch = stripped.match(/(\d{1,2})[:.](\d{2})(?:\s*([ap]m))?/i);
+  if (timeMatch) {
+    let h = parseInt(timeMatch[1], 10);
+    const m = parseInt(timeMatch[2], 10);
+    const ampm = timeMatch[3] ? timeMatch[3].toLowerCase() : null;
+    if (ampm === "pm" && h < 12) h += 12;
+    if (ampm === "am" && h === 12) h = 0;
+    hours = h;
+    minutes = m;
+  }
+
+  // Check for "today" / "hari ini"
+  if (lower.includes("today") || lower.includes("hari ini")) {
+    const d = new Date(now);
+    d.setHours(hours, minutes, 0, 0);
+    return d.getTime();
+  }
+
+  // Check for "tomorrow" / "esok"
+  if (lower.includes("tomorrow") || lower.includes("esok")) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    d.setHours(hours, minutes, 0, 0);
+    return d.getTime();
+  }
+
+  // Normalize Malay day names and month names
+  let cleaned = stripped
+    .replace(/\b(isnin|selasa|rabu|khamis|jumaat|sabtu|ahad)\b/gi, "")
+    .replace(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, "")
+    .replace(/\b(mon|tue|wed|thu|fri|sat|sun)\b/gi, "")
+    .replace(/\bjan(?:uari)?\b/gi, "Jan")
+    .replace(/\bfeb(?:ruari)?\b/gi, "Feb")
+    .replace(/\bmac\b/gi, "Mar")
+    .replace(/\bapr(?:il)?\b/gi, "Apr")
+    .replace(/\bmei\b/gi, "May")
+    .replace(/\bjun\b/gi, "Jun")
+    .replace(/\bjul(?:ai)?\b/gi, "Jul")
+    .replace(/\bogo(?:s)?\b/gi, "Aug")
+    .replace(/\bsep(?:tember)?\b/gi, "Sep")
+    .replace(/\bokt(?:ober)?\b/gi, "Oct")
+    .replace(/\bnov(?:ember)?\b/gi, "Nov")
+    .replace(/\bdis(?:ember)?\b/gi, "Dec")
+    .replace(/[,\(\)]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // 1. Try DD/MM/YYYY or DD.MM.YYYY or DD-MM-YYYY
+  const slashMatch = cleaned.match(/^(\d{1,2})[\.\/\-](\d{1,2})(?:[\.\/\-](\d{2,4}))?/);
+  if (slashMatch) {
+    const day = parseInt(slashMatch[1], 10);
+    const month = parseInt(slashMatch[2], 10) - 1;
+    let year = slashMatch[3] ? parseInt(slashMatch[3], 10) : now.getFullYear();
+    if (year < 100) year += 2000;
+    const d = new Date(year, month, day, hours, minutes, 0, 0);
+    if (!isNaN(d.getTime())) return d.getTime();
+  }
+
+  // 2. Try DD Month YYYY (e.g. "25 Oct 2024" or "25 October 2024")
+  const monthNames = {
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
+  };
+  const wordMatch = cleaned.match(/(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{2,4}))?/);
+  if (wordMatch) {
+    const day = parseInt(wordMatch[1], 10);
+    const monStr = wordMatch[2].slice(0, 3).toLowerCase();
+    if (monthNames[monStr] !== undefined) {
+      let year = wordMatch[3] ? parseInt(wordMatch[3], 10) : now.getFullYear();
+      if (year < 100) year += 2000;
+      const d = new Date(year, monthNames[monStr], day, hours, minutes, 0, 0);
+      if (!isNaN(d.getTime())) return d.getTime();
+    }
+  }
+
+  // 2B. Try Month DD YYYY (e.g. "October 25, 2024" or "Oct 25 2024")
+  const monthFirstMatch = cleaned.match(/([A-Za-z]+)\s+(\d{1,2})(?:[,\s]+(\d{2,4}))?/);
+  if (monthFirstMatch) {
+    const monStr = monthFirstMatch[1].slice(0, 3).toLowerCase();
+    if (monthNames[monStr] !== undefined) {
+      const day = parseInt(monthFirstMatch[2], 10);
+      let year = monthFirstMatch[3] ? parseInt(monthFirstMatch[3], 10) : now.getFullYear();
+      if (year < 100) year += 2000;
+      const d = new Date(year, monthNames[monStr], day, hours, minutes, 0, 0);
+      if (!isNaN(d.getTime())) return d.getTime();
+    }
+  }
+
+  // 3. Fallback to standard Date parse
+  const cleanStr = stripped.replace(/^[A-Za-z]+,\s*/, "");
+  const directDate = new Date(cleanStr);
+  if (!isNaN(directDate.getTime())) {
+    if (directDate.getFullYear() < 2000) {
+      directDate.setFullYear(now.getFullYear());
+    }
+    return directDate.getTime();
+  }
+
+  return null;
+}
+
+/**
+ * Parses SPeCTRUM /mod/assign/index.php?id={courseId}
+ * Extracts all assignment submission dropboxes and filters by student occurrence.
+ */
+export function parseCourseAssignmentsIndex(html, courseCode = "", courseName = "", studentOccurrence = "") {
+  if (!html) return [];
+  const assignments = [];
+
+  // 1. DOMParser Method (Browser / Extensions)
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+
+      const rows = doc.querySelectorAll("table.generaltable tr, table.mod_index tr");
+      rows.forEach((tr, idx) => {
+        const linkEl = tr.querySelector("a[href*='mod/assign/view.php']");
+        if (!linkEl) return;
+
+        const cells = tr.querySelectorAll("td");
+        if (cells.length < 2) return;
+
+        const rawUrl = linkEl.getAttribute("href") || "";
+        const url = rawUrl.startsWith("http") ? rawUrl : `https://spectrum.um.edu.my/${rawUrl.replace(/^\//, "")}`;
+        const idMatch = url.match(/id=(\d+)/);
+        const cmid = idMatch ? idMatch[1] : `assign_${idx}`;
+
+        const rawTitle = linkEl.textContent.trim();
+        const title = cleanMoodleTitle(rawTitle);
+
+        // Strictly exclude attendance items that lecturers created via Moodle assignment tool
+        if (isAttendanceActivity({ title, url, type: "assign" })) return;
+
+        // Filter by occurrence: if student specified an occurrence, title must match or be universal
+        const matchesOcc = isRespectiveOccurrence("", studentOccurrence, title);
+        if (!matchesOcc) return;
+
+        // Find due date cell and submission status cell
+        let dueDateText = "";
+        let submissionStatusText = "";
+
+        cells.forEach((td) => {
+          if (td.contains(linkEl)) return; // Name cell
+          const text = td.textContent.trim();
+          if (/\b(?:submitted|grading|graded|submission|dihantar|tiada|hantar|penghantaran)\b/i.test(text)) {
+            submissionStatusText = text;
+          } else if (!dueDateText && (/\d{1,2}[:.]\d{2}/.test(text) || /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|okt|mac|mei|ogo|dis)\b/i.test(text) || /\d{1,2}[\/\.\-]\d{1,2}/.test(text))) {
+            dueDateText = text;
+          } else if (!submissionStatusText && text && !/^(?:week|minggu|topic|topik)\s*\d*$/i.test(text) && !/^\d+$/.test(text)) {
+            submissionStatusText = text;
+          }
+        });
+
+        const dueTimestamp = dueDateText ? parseMoodleDateString(dueDateText) : null;
+
+        // Strictly exclude submissions overdue by more than 40 days
+        if (isOverdueMoreThan40Days(dueTimestamp)) return;
+
+        const isSubmitted = /\b(?:submitted|submission|graded|grading|selesai|dihantar|dinilai|diserahkan)\b/i.test(submissionStatusText) && !/\b(?:no submission|not submitted|belum|tiada|tidak|draft|draf)\b/i.test(submissionStatusText);
+
+        assignments.push({
+          id: cmid,
+          cmid,
+          title,
+          courseCode: courseCode || "Course",
+          courseName: courseName || courseCode,
+          dueDate: dueTimestamp ? new Date(dueTimestamp).toISOString() : "",
+          dueTimestamp,
+          formattedTime: dueDateText || (dueTimestamp ? new Date(dueTimestamp).toLocaleString("en-MY", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "No due date"),
+          dateLabel: /close|tutup/i.test(dueDateText) ? "Closes" : (/cut-?off/i.test(dueDateText) ? "Cut-off" : "Due"),
+          url,
+          type: "assign",
+          submissionStatus: submissionStatusText || (isSubmitted ? "Submitted" : "No submission"),
+          isSubmittedOnSpectrum: isSubmitted,
+          isCompleted: isSubmitted,
+          urgency: dueTimestamp ? calculateUrgency(dueTimestamp) : "upcoming",
+          matchesOccurrence: true
+        });
+      });
+
+      if (assignments.length > 0) return assignments;
+    } catch (e) {
+      console.warn("[Spectra Parser] DOM parseCourseAssignmentsIndex error:", e);
+    }
+  }
+
+  // 2. Regex Method Fallback (Node / Serverless / JSC)
+  const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let rowMatch;
+  let idx = 0;
+  while ((rowMatch = rowRegex.exec(html)) !== null) {
+    const rowHtml = rowMatch[1];
+    const linkMatch = rowHtml.match(/<a[^>]+href=["']([^"']*mod\/assign\/view\.php\?id=(\d+)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/i);
+    if (!linkMatch) continue;
+
+    const rawUrl = linkMatch[1];
+    const cmid = linkMatch[2];
+    const rawTitle = linkMatch[3].replace(/<[^>]+>/g, "").trim();
+    const title = cleanMoodleTitle(rawTitle);
+    const url = rawUrl.startsWith("http") ? rawUrl : `https://spectrum.um.edu.my/${rawUrl.replace(/^\//, "")}`;
+
+    // Strictly exclude attendance items
+    if (isAttendanceActivity({ title, url, type: "assign" })) continue;
+
+    const matchesOcc = isRespectiveOccurrence("", studentOccurrence, title);
+    if (!matchesOcc) continue;
+
+    const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+    const cells = [];
+    let cellM;
+    while ((cellM = cellRegex.exec(rowHtml)) !== null) {
+      cells.push(cellM[1].replace(/<[^>]+>/g, "").trim());
+    }
+
+    let dueDateText = "";
+    let submissionStatusText = "";
+    for (const c of cells) {
+      if (c.includes(rawTitle)) continue;
+      if (/\b(?:submitted|grading|graded|submission|dihantar|tiada|hantar|penghantaran)\b/i.test(c)) {
+        submissionStatusText = c;
+      } else if (!dueDateText && (/\d{1,2}[:.]\d{2}/.test(c) || /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|okt|mac|mei|ogo|dis)\b/i.test(c) || /\d{1,2}[\/\.\-]\d{1,2}/.test(c))) {
+        dueDateText = c;
+      } else if (!submissionStatusText && c && !/^(?:week|minggu|topic|topik)\s*\d*$/i.test(c) && !/^\d+$/.test(c)) {
+        submissionStatusText = c;
+      }
+    }
+
+    const dueTimestamp = dueDateText ? parseMoodleDateString(dueDateText) : null;
+
+    // Strictly exclude submissions overdue by more than 40 days
+    if (isOverdueMoreThan40Days(dueTimestamp)) continue;
+    const isSubmitted = /\b(?:submitted|submission|graded|grading|selesai|dihantar|dinilai|diserahkan)\b/i.test(submissionStatusText) && !/\b(?:no submission|not submitted|belum|tiada|tidak|draft|draf)\b/i.test(submissionStatusText);
+
+    assignments.push({
+      id: cmid,
+      cmid,
+      title,
+      courseCode: courseCode || "Course",
+      courseName: courseName || courseCode,
+      dueDate: dueTimestamp ? new Date(dueTimestamp).toISOString() : "",
+      dueTimestamp,
+      formattedTime: dueDateText || (dueTimestamp ? new Date(dueTimestamp).toLocaleString("en-MY", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "No due date"),
+      dateLabel: /close|tutup/i.test(dueDateText) ? "Closes" : (/cut-?off/i.test(dueDateText) ? "Cut-off" : "Due"),
+      url,
+      type: "assign",
+      submissionStatus: submissionStatusText || (isSubmitted ? "Submitted" : "No submission"),
+      isSubmittedOnSpectrum: isSubmitted,
+      isCompleted: isSubmitted,
+      urgency: dueTimestamp ? calculateUrgency(dueTimestamp) : "upcoming",
+      matchesOccurrence: true
+    });
+  }
+
+  return assignments;
+}
+
+/**
+ * Parses SPeCTRUM /mod/quiz/index.php?id={courseId}
+ * Extracts all quiz activities, their closed/due dates, and submission/attempt status.
+ */
+export function parseCourseQuizzesIndex(html, courseCode = "", courseName = "", studentOccurrence = "") {
+  if (!html) return [];
+  const quizzes = [];
+
+  // 1. DOMParser Method (Browser / Extensions)
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+
+      const rows = doc.querySelectorAll("table.generaltable tr, table.mod_index tr");
+      rows.forEach((tr, idx) => {
+        const linkEl = tr.querySelector("a[href*='mod/quiz/view.php']");
+        if (!linkEl) return;
+
+        const cells = tr.querySelectorAll("td");
+        if (cells.length < 2) return;
+
+        const rawUrl = linkEl.getAttribute("href") || "";
+        const url = rawUrl.startsWith("http") ? rawUrl : `https://spectrum.um.edu.my/${rawUrl.replace(/^\//, "")}`;
+        const idMatch = url.match(/id=(\d+)/);
+        const cmid = idMatch ? idMatch[1] : `quiz_${idx}`;
+
+        const rawTitle = linkEl.textContent.trim();
+        const title = cleanMoodleTitle(rawTitle);
+
+        // Strictly exclude attendance items
+        if (isAttendanceActivity({ title, url, type: "quiz" })) return;
+
+        // Filter by occurrence
+        const matchesOcc = isRespectiveOccurrence("", studentOccurrence, title);
+        if (!matchesOcc) return;
+
+        let closeDateText = "";
+        let submissionStatusText = "";
+
+        cells.forEach((td) => {
+          if (td.contains(linkEl)) return; // Name cell
+          const text = td.textContent.trim();
+          if (/\b(?:submitted|grading|graded|completed|selesai|dihantar|dinilai|diserahkan)\b/i.test(text)) {
+            submissionStatusText = text;
+          } else if (!closeDateText && (/\d{1,2}[:.]\d{2}/.test(text) || /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|okt|mac|mei|ogo|dis)\b/i.test(text) || /\d{1,2}[\/\.\-]\d{1,2}/.test(text))) {
+            closeDateText = text;
+          } else if (!submissionStatusText && text && !/^(?:week|minggu|topic|topik)\s*\d*$/i.test(text) && !/^\d+$/.test(text) && text !== "-") {
+            submissionStatusText = text;
+          }
+        });
+
+        const dueTimestamp = closeDateText ? parseMoodleDateString(closeDateText) : null;
+
+        // Strictly exclude submissions overdue by more than 40 days
+        if (isOverdueMoreThan40Days(dueTimestamp)) return;
+
+        const isSubmitted = (
+          /\b(?:submitted|completed|graded|grading|selesai|dihantar|dinilai|finished|review)\b/i.test(submissionStatusText) ||
+          /\d+(?:\.\d+)?\s*\/\s*\d+/.test(submissionStatusText) ||
+          /\d+%\s*$/.test(submissionStatusText)
+        ) && !/\b(?:no attempt|not submitted|belum|tiada|tidak|draft|draf)\b/i.test(submissionStatusText);
+
+        quizzes.push({
+          id: cmid,
+          cmid,
+          title,
+          courseCode: courseCode || "Course",
+          courseName: courseName || courseCode,
+          dueDate: dueTimestamp ? new Date(dueTimestamp).toISOString() : "",
+          dueTimestamp,
+          formattedTime: closeDateText || (dueTimestamp ? new Date(dueTimestamp).toLocaleString("en-MY", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "No due date"),
+          dateLabel: "Closes",
+          url,
+          type: "quiz",
+          submissionStatus: submissionStatusText || (isSubmitted ? "Submitted" : "No submission"),
+          isSubmittedOnSpectrum: isSubmitted,
+          isCompleted: isSubmitted,
+          urgency: dueTimestamp ? calculateUrgency(dueTimestamp) : "upcoming",
+          matchesOccurrence: true
+        });
+      });
+
+      if (quizzes.length > 0) return quizzes;
+    } catch (e) {
+      console.warn("[Spectra Parser] DOM parseCourseQuizzesIndex error:", e);
+    }
+  }
+
+  // 2. Regex Method Fallback (Node / Serverless / JSC)
+  const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let rowMatch;
+  let idx = 0;
+  while ((rowMatch = rowRegex.exec(html)) !== null) {
+    const rowHtml = rowMatch[1];
+    const linkMatch = rowHtml.match(/<a[^>]+href=["']([^"']*mod\/quiz\/view\.php\?id=(\d+)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/i);
+    if (!linkMatch) continue;
+
+    const rawUrl = linkMatch[1];
+    const cmid = linkMatch[2];
+    const rawTitle = linkMatch[3].replace(/<[^>]+>/g, "").trim();
+    const title = cleanMoodleTitle(rawTitle);
+    const url = rawUrl.startsWith("http") ? rawUrl : `https://spectrum.um.edu.my/${rawUrl.replace(/^\//, "")}`;
+
+    if (isAttendanceActivity({ title, url, type: "quiz" })) continue;
+
+    const matchesOcc = isRespectiveOccurrence("", studentOccurrence, title);
+    if (!matchesOcc) continue;
+
+    const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+    const cells = [];
+    let cellM;
+    while ((cellM = cellRegex.exec(rowHtml)) !== null) {
+      cells.push(cellM[1].replace(/<[^>]+>/g, "").trim());
+    }
+
+    let closeDateText = "";
+    let submissionStatusText = "";
+    for (const c of cells) {
+      if (c.includes(rawTitle)) continue;
+      if (/\b(?:submitted|grading|graded|completed|selesai|dihantar|dinilai|diserahkan)\b/i.test(c)) {
+        submissionStatusText = c;
+      } else if (!closeDateText && (/\d{1,2}[:.]\d{2}/.test(c) || /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|okt|mac|mei|ogo|dis)\b/i.test(c) || /\d{1,2}[\/\.\-]\d{1,2}/.test(c))) {
+        closeDateText = c;
+      } else if (!submissionStatusText && c && !/^(?:week|minggu|topic|topik)\s*\d*$/i.test(c) && !/^\d+$/.test(c) && c !== "-") {
+        submissionStatusText = c;
+      }
+    }
+
+    const dueTimestamp = closeDateText ? parseMoodleDateString(closeDateText) : null;
+    if (isOverdueMoreThan40Days(dueTimestamp)) continue;
+
+    const isSubmitted = (
+      /\b(?:submitted|completed|graded|grading|selesai|dihantar|dinilai|finished|review)\b/i.test(submissionStatusText) ||
+      /\d+(?:\.\d+)?\s*\/\s*\d+/.test(submissionStatusText) ||
+      /\d+%\s*$/.test(submissionStatusText)
+    ) && !/\b(?:no attempt|not submitted|belum|tiada|tidak|draft|draf)\b/i.test(submissionStatusText);
+
+    quizzes.push({
+      id: cmid,
+      cmid,
+      title,
+      courseCode: courseCode || "Course",
+      courseName: courseName || courseCode,
+      dueDate: dueTimestamp ? new Date(dueTimestamp).toISOString() : "",
+      dueTimestamp,
+      formattedTime: closeDateText || (dueTimestamp ? new Date(dueTimestamp).toLocaleString("en-MY", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "No due date"),
+      dateLabel: "Closes",
+      url,
+      type: "quiz",
+      submissionStatus: submissionStatusText || (isSubmitted ? "Submitted" : "No submission"),
+      isSubmittedOnSpectrum: isSubmitted,
+      isCompleted: isSubmitted,
+      urgency: dueTimestamp ? calculateUrgency(dueTimestamp) : "upcoming",
+      matchesOccurrence: true
+    });
+  }
+
+  return quizzes;
+}
+
+/**
+ * Parses individual assignment/quiz page HTML (/mod/assign/view.php?id=..., /mod/quiz/view.php?id=...)
+ * Extracts authoritative due date, closed date, time remaining, and submission status from Moodle's native table or info boxes.
+ */
+export function parseAssignmentViewPage(html) {
+  if (!html) return null;
+  let dueDateText = "";
+  let dateLabel = "Due";
+  let timeRemainingText = "";
+  let submissionStatus = "";
+
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const rows = doc.querySelectorAll("table.generaltable tr, .submissionstatustable tr, table tr");
+      rows.forEach((tr) => {
+        const th = (tr.querySelector("th, td.c0, td:first-child")?.textContent || "").trim().toLowerCase();
+        const td = (tr.querySelector("td.c1, td:last-child")?.textContent || "").trim();
+        if (
+          (th.includes("due") && !th.includes("overdue")) ||
+          th.includes("closed date") ||
+          th.includes("close date") ||
+          th.includes("closed on") ||
+          th.includes("closed") ||
+          th.includes("closes") ||
+          th.includes("quiz closes") ||
+          th.includes("quiz closed") ||
+          th.includes("cut-off date") ||
+          th.includes("cutoff date") ||
+          th.includes("tarikh akhir") ||
+          th.includes("tarikh tutup") ||
+          th.includes("ditutup pada") ||
+          th.includes("ditutup")
+        ) {
+          if (!dueDateText || th.includes("closed date") || th.includes("close") || th.includes("cut-off")) {
+            dueDateText = td;
+            if (th.includes("close") || th.includes("tutup")) {
+              dateLabel = "Closes";
+            } else if (th.includes("cut-off") || th.includes("cutoff")) {
+              dateLabel = "Cut-off";
+            } else {
+              dateLabel = "Due";
+            }
+          }
+        } else if (th.includes("time remaining") || th.includes("masa yang tinggal")) {
+          timeRemainingText = td;
+        } else if (th.includes("submission status") || th.includes("status penghantaran") || th.includes("status") || th.includes("state")) {
+          submissionStatus = td;
+        }
+      });
+
+      // If not found in table, check quizinfo or activity description boxes
+      if (!dueDateText) {
+        const infoBlocks = doc.querySelectorAll(".quizinfo p, .generalbox p, .box p, .activity-description p, p");
+        for (const p of infoBlocks) {
+          const txt = (p.textContent || "").trim();
+          const match = txt.match(/(?:this\s+quiz\s+(?:will\s+)?closed?(?:\s+on)?|this\s+assignment\s+is\s+closed(?:\s+on)?|quiz\s+closed?|closed?\s*(?:date|on)?|close\s*(?:date)?|(?:was\s+)?due(?:\s*(?:date|on))?|cut-?off\s*date|cutoff\s*date|tarikh\s*(?:tutup|akhir)|ditutup\s*(?:pada)?)[\s:]+([^\n\r]+)/i);
+          if (match) {
+            dueDateText = match[1].trim();
+            if (/close|tutup/i.test(match[0])) dateLabel = "Closes";
+            else if (/cut-?off/i.test(match[0])) dateLabel = "Cut-off";
+            else dateLabel = "Due";
+            break;
+          }
+        }
+      }
+
+      // Check quiz attempts summary for submission status
+      if (!submissionStatus) {
+        const quizTable = doc.querySelector(".quizattemptsummary, table.quizreviewsummary");
+        if (quizTable) {
+          const tableText = quizTable.textContent || "";
+          if (/\b(?:Finished|Submitted|Review|Telah dinilai|Selesai)\b/i.test(tableText)) {
+            submissionStatus = "Submitted";
+          }
+        }
+      }
+    } catch (_) { }
+  }
+
+  if (!dueDateText) {
+    const dueMatch = html.match(/(?:(?:Was\s+)?Due(?:\s*date)?|Closed?\s*date|Close\s*date|Closed\s+on|Quiz\s*closes?|Quiz\s*closed|Cut-?off\s*date|Tarikh\s*(?:akhir|tutup)|Ditutup\s*(?:pada)?)<\/(?:th|td)>\s*<td[^>]*>([\s\S]*?)<\/td>/i);
+    if (dueMatch) {
+      dueDateText = dueMatch[1].replace(/<[^>]+>/g, "").trim();
+      if (/close|tutup/i.test(dueMatch[0])) dateLabel = "Closes";
+      else if (/cut-?off/i.test(dueMatch[0])) dateLabel = "Cut-off";
+      else dateLabel = "Due";
+    }
+  }
+  if (!dueDateText) {
+    const textMatch = html.match(/(?:this\s+quiz\s+(?:will\s+)?closed?(?:\s+on)?|this\s+assignment\s+is\s+closed(?:\s+on)?|quiz\s+closed?|closed?\s*(?:date|on)?|close\s*(?:date)?|(?:was\s+)?due(?:\s*(?:date|on))?|cut-?off\s*date|cutoff\s*date|tarikh\s*(?:tutup|akhir)|ditutup\s*(?:pada)?)[\s:]+([0-9A-Za-z\s,.:\-]+(?:am|pm|[\d]{2,4}))/i);
+    if (textMatch) {
+      dueDateText = textMatch[1].replace(/<[^>]+>/g, "").trim();
+      if (/close|tutup/i.test(textMatch[0])) dateLabel = "Closes";
+      else if (/cut-?off/i.test(textMatch[0])) dateLabel = "Cut-off";
+      else dateLabel = "Due";
+    }
+  }
+  if (!timeRemainingText) {
+    const remMatch = html.match(/(?:Time remaining|Masa yang tinggal)<\/(?:th|td)>\s*<td[^>]*>([\s\S]*?)<\/td>/i);
+    if (remMatch) timeRemainingText = remMatch[1].replace(/<[^>]+>/g, "").trim();
+  }
+  if (!submissionStatus) {
+    const statMatch = html.match(/(?:Submission status|Status penghantaran)<\/(?:th|td)>\s*<td[^>]*>([\s\S]*?)<\/td>/i);
+    if (statMatch) {
+      submissionStatus = statMatch[1].replace(/<[^>]+>/g, "").trim();
+    } else {
+      // Only check within quiz attempts summary table/div markup for quiz completion evidence
+      const quizSummaryMatch = html.match(/<(?:table|div)[^>]*class="[^"]*(?:quizattemptsummary|quizreviewsummary)[^"]*"[^>]*>([\s\S]*?)<\/(?:table|div)>/i);
+      if (quizSummaryMatch && /\b(?:Finished|Submitted|Review|Telah dinilai|Selesai)\b/i.test(quizSummaryMatch[1])) {
+        submissionStatus = "Submitted";
+      }
+    }
+  }
+
+  let dueTimestamp = dueDateText ? parseMoodleDateString(dueDateText) : null;
+  if (!dueTimestamp && timeRemainingText) {
+    const overdueMatch = timeRemainingText.match(/(?:overdue\s+by|lewat\s+sebanyak)[\s:]*(\d+)\s*(?:days?|hari)/i);
+    if (overdueMatch) {
+      const overdueDays = parseInt(overdueMatch[1], 10);
+      dueTimestamp = Date.now() - (overdueDays * 24 * 60 * 60 * 1000);
+    }
+  }
+  const isSubmitted = /\b(?:submitted|grading|graded|dihantar|selesai|dinilai|diserahkan|finished|completed|review)\b/i.test(submissionStatus) && !/\b(?:no attempt|not submitted|belum|tiada|tidak|draft|draf|in progress)\b/i.test(submissionStatus);
+
+  return {
+    dueDateText,
+    dueTimestamp,
+    dateLabel,
+    timeRemainingText,
+    submissionStatus,
+    isSubmitted
+  };
+}
+
+/**
+ * Scrapes /course/view.php?id={courseId} from top to bottom
+ * Discovers all submission activities (assignments, quizzes, workshops, turnitin)
+ * across every section and filters by student occurrence.
+ */
+export function parseCourseViewSubmissions(html, courseCode = "", courseName = "", studentOccurrence = "") {
+  if (!html) return [];
+  const submissions = [];
+  const seenIds = new Set();
+
+  // 1. DOMParser Method
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+
+      const activityLinks = doc.querySelectorAll(
+        "a[href*='mod/assign/view.php'], a[href*='mod/quiz/view.php'], a[href*='mod/workshop/view.php'], a[href*='mod/turnitintooltwo/view.php']"
+      );
+
+      activityLinks.forEach((linkEl, idx) => {
+        const rawUrl = linkEl.getAttribute("href") || "";
+        const idMatch = rawUrl.match(/id=(\d+)/);
+        if (!idMatch) return;
+        const cmid = idMatch[1];
+        if (seenIds.has(cmid)) return;
+        seenIds.add(cmid);
+
+        const url = rawUrl.startsWith("http") ? rawUrl : `https://spectrum.um.edu.my/${rawUrl.replace(/^\//, "")}`;
+        const rawTitle = linkEl.querySelector(".instancename") ? linkEl.querySelector(".instancename").textContent : linkEl.textContent;
+        const title = cleanMoodleTitle(rawTitle);
+
+        let type = "assign";
+        if (url.includes("mod/quiz")) type = "quiz";
+        else if (url.includes("mod/workshop")) type = "workshop";
+        else if (url.includes("turnitintooltwo")) type = "turnitin";
+        else if (url.includes("mod/attendance")) type = "attendance";
+
+        // Strictly exclude attendance activities
+        if (isAttendanceActivity({ title, url, type })) return;
+
+        // Strict occurrence filter
+        const matchesOcc = isRespectiveOccurrence("", studentOccurrence, title);
+        if (!matchesOcc) return;
+
+        // Find parent container to inspect due dates and completion tags
+        const parentAct = linkEl.closest("li.activity, .activityinstance, .activity-item, div.activity");
+        let dueDateText = "";
+        let isSubmitted = false;
+
+        if (parentAct) {
+          const actText = parentAct.textContent;
+
+          // Due date & closed date patterns
+          const dueM = actText.match(/(?:due(?:\s*date)?|closed?\s*date|close\s*date|quiz\s*closes?|closes?|closed(?:\s+on)?|cut-?off\s*date|cutoff\s*date|tarikh\s*(?:akhir|tutup)|ditutup\s*(?:pada)?|tutup)[\s:]+([^\n\r<]+)/i);
+          if (dueM) {
+            dueDateText = dueM[1].trim();
+          }
+
+          // Submission / completion indicator - use STRICT evidence only.
+          // Check for Moodle completion badge elements, NOT the full activity text
+          // (which includes lecturer instructions containing words like "submit your work").
+          const completionBadge = parentAct.querySelector(
+            '.badge-success, .badge-info, .completion-complete, .autocompletion img[title*="Completed"], ' +
+            '.autocompletion img[title*="Done"], .autocompletion img[title*="Selesai"], ' +
+            '.completioninfo .complete, .activity-completion .complete'
+          );
+          if (completionBadge) {
+            isSubmitted = true;
+          }
+
+          // Also check for inline submission status text that is clearly a Moodle status label,
+          // not embedded in instructional paragraphs.
+          if (!isSubmitted) {
+            const statusEls = parentAct.querySelectorAll('.submissionstatussubmitted, .submissionstatus, .submission-status, .activity-altcontent, .badge');
+            for (const el of statusEls) {
+              const elText = (el.textContent || '').trim();
+              if (/\b(?:submitted|graded|grading|dihantar|selesai|dinilai|diserahkan)\b/i.test(elText) &&
+                !/\b(?:not submitted|no submission|belum|tiada|tidak|draft|draf)\b/i.test(elText)) {
+                isSubmitted = true;
+                break;
+              }
+            }
+          }
+        }
+
+        const dueTimestamp = dueDateText ? parseMoodleDateString(dueDateText) : null;
+
+        // Strictly exclude items overdue by more than 40 days
+        if (isOverdueMoreThan40Days(dueTimestamp)) return;
+
+        const isClosed = /close|tutup/i.test(dueDateText) || type === "quiz";
+        const dateLabel = isClosed ? "Closes" : (/cut-?off/i.test(dueDateText) ? "Cut-off" : "Due");
+
+        submissions.push({
+          id: cmid,
+          cmid,
+          title,
+          courseCode: courseCode || "Course",
+          courseName: courseName || courseCode,
+          dueDate: dueTimestamp ? new Date(dueTimestamp).toISOString() : "",
+          dueTimestamp,
+          formattedTime: dueDateText || (dueTimestamp ? new Date(dueTimestamp).toLocaleString("en-MY", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "View Dropbox"),
+          dateLabel,
+          url,
+          type,
+          submissionStatus: isSubmitted ? "Submitted" : "No submission",
+          isSubmittedOnSpectrum: isSubmitted,
+          isCompleted: isSubmitted,
+          urgency: dueTimestamp ? calculateUrgency(dueTimestamp) : "upcoming",
+          matchesOccurrence: true
+        });
+      });
+
+      if (submissions.length > 0) return submissions;
+    } catch (e) {
+      console.warn("[Spectra Parser] DOM parseCourseViewSubmissions error:", e);
+    }
+  }
+
+  // 2. Regex Method Fallback
+  const linkRegex = /<a[^>]+href=["']([^"']*mod\/(?:assign|quiz|workshop|turnitintooltwo)\/view\.php\?id=(\d+)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = linkRegex.exec(html)) !== null) {
+    const rawUrl = match[1];
+    const cmid = match[2];
+    if (seenIds.has(cmid)) continue;
+    seenIds.add(cmid);
+
+    const rawTitle = match[3].replace(/<[^>]+>/g, "").trim();
+    const title = cleanMoodleTitle(rawTitle);
+    const url = rawUrl.startsWith("http") ? rawUrl : `https://spectrum.um.edu.my/${rawUrl.replace(/^\//, "")}`;
+
+    let type = "assign";
+    if (url.includes("mod/quiz")) type = "quiz";
+    else if (url.includes("mod/workshop")) type = "workshop";
+    else if (url.includes("turnitintooltwo")) type = "turnitin";
+    else if (url.includes("mod/attendance")) type = "attendance";
+
+    // Strictly exclude attendance activities
+    if (isAttendanceActivity({ title, url, type })) continue;
+
+    const matchesOcc = isRespectiveOccurrence("", studentOccurrence, title);
+    if (!matchesOcc) continue;
+
+    // Extract nearby text snippet to capture due date and submission status
+    const contextSnippet = html.slice(match.index, match.index + 1200);
+    const dueM = contextSnippet.match(/(?:due(?:\s*date)?|closed?\s*date|close\s*date|quiz\s*closes?|closes?|closed(?:\s+on)?|cut-?off\s*date|cutoff\s*date|tarikh\s*(?:akhir|tutup)|ditutup\s*(?:pada)?|tutup)[\s:]+([^\n\r<]+)/i);
+    let dueDateText = "";
+    if (dueM) {
+      dueDateText = dueM[1].trim();
+    }
+    // Strict: Only detect submission via Moodle-specific CSS class markers or completion badge HTML,
+    // NOT via generic keyword matching on the full context (which includes lecturer instructions).
+    const isSubmitted = (
+      /class=["'][^"']*(?:submissionstatussubmitted|completion-complete|badge-success)[^"']*["']/i.test(contextSnippet) ||
+      /img[^>]+title=["'](?:Completed|Done|Selesai)["']/i.test(contextSnippet)
+    );
+    const dueTimestamp = dueDateText ? parseMoodleDateString(dueDateText) : null;
+
+    // Strictly exclude items overdue by more than 40 days
+    if (isOverdueMoreThan40Days(dueTimestamp)) continue;
+
+    const isClosed = /close|tutup/i.test(dueDateText) || type === "quiz";
+    const dateLabel = isClosed ? "Closes" : (/cut-?off/i.test(dueDateText) ? "Cut-off" : "Due");
+
+    submissions.push({
+      id: cmid,
+      cmid,
+      title,
+      courseCode: courseCode || "Course",
+      courseName: courseName || courseCode,
+      dueDate: dueTimestamp ? new Date(dueTimestamp).toISOString() : "",
+      dueTimestamp,
+      formattedTime: dueDateText || (dueTimestamp ? new Date(dueTimestamp).toLocaleString("en-MY", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "View Dropbox"),
+      dateLabel,
+      url,
+      type,
+      submissionStatus: isSubmitted ? "Submitted" : (dueDateText ? "No submission" : "View on SPeCTRUM"),
+      isSubmittedOnSpectrum: isSubmitted,
+      isCompleted: isSubmitted,
+      urgency: dueTimestamp ? calculateUrgency(dueTimestamp) : "upcoming",
+      matchesOccurrence: true
+    });
+  }
+
+  return submissions;
+}
+
+/**
+ * Categorize a course module item into Slides, Tutorials, or Labs
+ */
+export function categorizeModuleItem(title, url = "", rawExt = "") {
+  const combined = `${title} ${url} ${rawExt}`.toLowerCase();
+
+  // Labs & Practicals
+  if (
+    combined.includes("lab") ||
+    combined.includes("practical") ||
+    combined.includes("source") ||
+    combined.includes("code") ||
+    combined.includes(".zip") ||
+    combined.includes(".py") ||
+    combined.includes(".java") ||
+    combined.includes(".ipynb") ||
+    combined.includes(".cpp") ||
+    combined.includes(".c") ||
+    combined.includes(".sql") ||
+    combined.includes(".csv") ||
+    combined.includes("dataset")
+  ) {
+    return "labs";
+  }
+
+  // Tutorials & Problem Sets
+  if (
+    combined.includes("tutorial") ||
+    combined.includes("tut") ||
+    combined.includes("worksheet") ||
+    combined.includes("question") ||
+    combined.includes("exercise") ||
+    combined.includes("problem") ||
+    combined.includes(".docx")
+  ) {
+    return "tutorials";
+  }
+
+  // Lecture Slides & Notes (Default fallback for slides / resources)
+  return "slides";
+}
+
+/**
+ * Detect file extension from URL, title, or Moodle activity icon
+ */
+export function detectFileExtension(title, url, iconSrc = "") {
+  const match = (title + " " + url).match(/\.([a-zA-Z0-9]{2,5})(?:\?|$|\s)/);
+  if (match) {
+    return match[1].toLowerCase();
+  }
+  if (iconSrc.includes("pdf")) return "pdf";
+  if (iconSrc.includes("powerpoint") || iconSrc.includes("ppt")) return "pptx";
+  if (iconSrc.includes("word") || iconSrc.includes("document")) return "docx";
+  if (iconSrc.includes("archive") || iconSrc.includes("zip")) return "zip";
+  if (url.includes("mod/resource")) return "pdf";
+  return "pdf";
+}
+
+/**
+ * Parses course page HTML (/course/view.php?id=...)
+ * Returns categorized items organized by week/section
+ */
+export function parseCoursePage(html, requestedWeek = null) {
+  if (!html) return {};
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+  const weeksMap = {};
+
+  // Sections in Moodle are typically li.section, div.section, or #section-N
+  const sections = doc.querySelectorAll("li.section, div.section, .course-content ul.topics > li, ul.weeks > li");
+
+  sections.forEach((section, idx) => {
+    // Determine week index
+    let weekNum = idx + 1;
+    const secId = section.getAttribute("id") || "";
+    const idMatch = secId.match(/section-(\d+)/);
+    if (idMatch && parseInt(idMatch[1], 10) > 0) {
+      weekNum = parseInt(idMatch[1], 10);
+    }
+
+    const headingEl = section.querySelector(".sectionname, .section-title, h3");
+    const headingText = headingEl ? headingEl.textContent.trim() : `Week ${weekNum}`;
+
+    // Check if heading has "Week X"
+    const weekMatch = headingText.match(/(?:Week|Minggu)\s*(\d+)/i);
+    if (weekMatch) {
+      weekNum = parseInt(weekMatch[1], 10);
+    }
+
+    if (!weeksMap[weekNum]) {
+      weeksMap[weekNum] = {
+        week: weekNum,
+        title: headingText,
+        slides: [],
+        tutorials: [],
+        labs: []
+      };
+    }
+
+    // Parse activities inside this section
+    const activities = section.querySelectorAll("li.activity, .activityinstance");
+    activities.forEach((act) => {
+      const linkEl = act.querySelector("a[href*='mod/resource'], a[href*='mod/folder'], a[href*='mod/url'], a[href*='pluginfile.php']");
+      if (!linkEl) return;
+
+      const rawUrl = linkEl.getAttribute("href");
+      let url = rawUrl;
+      if (url && !url.startsWith("http")) {
+        url = "https://spectrum.um.edu.my/" + url.replace(/^\//, "");
+      }
+
+      const iconEl = act.querySelector("img.activityicon, .icon");
+      const iconSrc = iconEl ? (iconEl.getAttribute("src") || "") : "";
+
+      const rawTitle = linkEl.querySelector(".instancename") ? linkEl.querySelector(".instancename").textContent : linkEl.textContent;
+      const title = cleanMoodleTitle(rawTitle);
+      const ext = detectFileExtension(title, url, iconSrc);
+      const category = categorizeModuleItem(title, url, ext);
+
+      // Ensure title has extension for clear download naming
+      let cleanFilename = title;
+      if (!cleanFilename.toLowerCase().endsWith("." + ext)) {
+        cleanFilename += `.${ext}`;
+      }
+
+      weeksMap[weekNum][category].push({
+        id: act.getAttribute("id") || `item_${Math.random().toString(36).substring(2, 9)}`,
+        name: cleanFilename,
+        ext,
+        url,
+        category,
+        size: "SPeCTRUM File"
+      });
+    });
+  });
+
+  return weeksMap;
+}
+
+/**
+ * Parses user's enrolled courses from /my/ (dashboard)
+ */
+export function parseEnrolledCourses(html) {
+  if (!html) return [];
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+  const courses = [];
+  const seenIds = new Set();
+
+  const links = doc.querySelectorAll("a[href*='course/view.php?id=']");
+  links.forEach((a) => {
+    const href = a.getAttribute("href");
+    const idMatch = href.match(/id=(\d+)/);
+    if (!idMatch) return;
+    const courseId = idMatch[1];
+    if (seenIds.has(courseId) || courseId === "1") return; // id=1 is site home
+    seenIds.add(courseId);
+
+    const fullText = a.textContent.trim();
+    if (!fullText || fullText.length < 3) return;
+
+    const courseCode = extractCourseCode(fullText);
+    courses.push({
+      id: courseId,
+      code: courseCode,
+      name: fullText.replace(courseCode, "").replace(/^[\s\-:]+/, "").trim() || fullText,
+      shortname: courseCode,
+      url: href.startsWith("http") ? href : `https://spectrum.um.edu.my/course/view.php?id=${courseId}`
+    });
+  });
+
+  return courses;
+}
+
+/**
+ * Parses diverse Moodle forum date strings into unix epoch timestamp (milliseconds).
+ * Handles ISO timestamps, full dates, missing-year dates, day-of-week prefixes,
+ * relative dates ('Today', 'Yesterday'), and falls back to Moodle discussion ID.
+ *
+ * @param {string} dateStr - Raw date string from SPeCTRUM forum
+ * @param {string|number} [discussionId] - Moodle discussion ID for sequential fallback
+ * @returns {number} - Unix timestamp in milliseconds
+ */
+export function parseNoticeTimestamp(dateStr, discussionId = null) {
+  if (typeof dateStr === "number" && !isNaN(dateStr) && dateStr > 0) {
+    return dateStr < 1e11 ? dateStr * 1000 : dateStr;
+  }
+
+  const str = String(dateStr || "").trim();
+  const currentYear = new Date().getFullYear();
+
+  if (str) {
+    // 1. Direct standard parse
+    let ts = Date.parse(str);
+    if (!isNaN(ts) && ts > 0) return ts;
+
+    // 2. Remove day of week (e.g. "Wed, 21 Oct 2026, 09:15 AM" -> "21 Oct 2026, 09:15 AM")
+    const noDay = str.replace(/^(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*[,\s]+/i, "").trim();
+    ts = Date.parse(noDay);
+    if (!isNaN(ts) && ts > 0) return ts;
+
+    // 3. Handle dates without year (e.g. "21 Oct, 09:15" or "21 Oct 09:15 AM")
+    if (/\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b/i.test(noDay) && !/\b20\d\d\b/.test(noDay)) {
+      const withYear = noDay.replace(/(\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b)/i, `$1 ${currentYear}`);
+      ts = Date.parse(withYear);
+      if (!isNaN(ts) && ts > 0) return ts;
+    }
+
+    // 4. Handle DD/MM/YYYY or DD-MM-YYYY format
+    const dmyMatch = noDay.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*([ap]m))?)?/i);
+    if (dmyMatch) {
+      const day = parseInt(dmyMatch[1], 10);
+      const month = parseInt(dmyMatch[2], 10) - 1;
+      let yr = parseInt(dmyMatch[3], 10);
+      if (yr < 100) yr += 2000;
+      let hr = dmyMatch[4] ? parseInt(dmyMatch[4], 10) : 0;
+      const min = dmyMatch[5] ? parseInt(dmyMatch[5], 10) : 0;
+      const sec = dmyMatch[6] ? parseInt(dmyMatch[6], 10) : 0;
+      const ampm = dmyMatch[7] ? dmyMatch[7].toUpperCase() : null;
+      if (ampm === "PM" && hr < 12) hr += 12;
+      if (ampm === "AM" && hr === 12) hr = 0;
+      const d = new Date(yr, month, day, hr, min, sec);
+      if (!isNaN(d.getTime())) return d.getTime();
+    }
+
+    // 5. Handle "Today, 10:30 AM" or "Yesterday, 4:15 PM"
+    const now = new Date();
+    if (/\btoday\b/i.test(noDay)) {
+      const tMatch = noDay.match(/(\d{1,2}):(\d{2})(?:\s*([ap]m))?/i);
+      let hr = tMatch ? parseInt(tMatch[1], 10) : 12;
+      const min = tMatch ? parseInt(tMatch[2], 10) : 0;
+      const ampm = tMatch && tMatch[3] ? tMatch[3].toUpperCase() : null;
+      if (ampm === "PM" && hr < 12) hr += 12;
+      if (ampm === "AM" && hr === 12) hr = 0;
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate(), hr, min).getTime();
+    }
+    if (/\byesterday\b/i.test(noDay)) {
+      const tMatch = noDay.match(/(\d{1,2}):(\d{2})(?:\s*([ap]m))?/i);
+      let hr = tMatch ? parseInt(tMatch[1], 10) : 12;
+      const min = tMatch ? parseInt(tMatch[2], 10) : 0;
+      const ampm = tMatch && tMatch[3] ? tMatch[3].toUpperCase() : null;
+      if (ampm === "PM" && hr < 12) hr += 12;
+      if (ampm === "AM" && hr === 12) hr = 0;
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, hr, min).getTime();
+    }
+  }
+
+  // 6. Fallback to discussion ID if numeric (Moodle discussion IDs are monotonically increasing)
+  const numId = parseInt(discussionId, 10);
+  if (!isNaN(numId) && numId > 0) {
+    return numId;
+  }
+
+  return 0;
+}
+
+/**
+ * Parses forum discussions from /mod/forum/view.php?id=...
+ */
+export function parseForumDiscussions(html, courseCode = "UM") {
+  if (!html) return [];
+  const discussions = [];
+
+  // Method 1: DOMParser (when available in window / browser context)
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+
+      const rows = doc.querySelectorAll("tr.discussion, .discussion-list .discussion, tr[data-discussionid]");
+      rows.forEach((row, idx) => {
+        try {
+          const topicEl = row.querySelector(".topic a, a[href*='discuss.php?d=']");
+          if (!topicEl) return;
+
+          const subject = topicEl.textContent.trim();
+          let url = topicEl.getAttribute("href");
+          if (url && !url.startsWith("http")) {
+            url = "https://spectrum.um.edu.my/" + url.replace(/^\//, "");
+          }
+
+          const idMatch = url.match(/d=(\d+)/);
+          const discussionId = idMatch ? idMatch[1] : `disc_${idx}_${Date.now()}`;
+
+          const authorEl = row.querySelector(".author, td.author, .author-name, .media-body h5");
+          const author = authorEl ? authorEl.textContent.trim() : "Course Instructor";
+
+          const dateEl = row.querySelector(".lastpost, td.lastpost, time, .text-muted time");
+          const timeTag = row.querySelector("time");
+          const dateText = dateEl ? dateEl.textContent.trim() : (timeTag ? timeTag.textContent.trim() : "Recent");
+          const dateAttr = timeTag ? (timeTag.getAttribute("datetime") || timeTag.getAttribute("data-timestamp")) : null;
+
+          let timestamp = 0;
+          if (dateAttr) {
+            timestamp = parseNoticeTimestamp(dateAttr, discussionId);
+          }
+          if (!timestamp) {
+            timestamp = parseNoticeTimestamp(dateText, discussionId);
+          }
+
+          discussions.push({
+            id: discussionId,
+            courseCode,
+            subject,
+            author,
+            date: dateText,
+            url,
+            timestamp
+          });
+        } catch (err) {
+          console.warn("Failed parsing forum discussion row:", err);
+        }
+      });
+
+      if (discussions.length > 0) {
+        discussions.sort((a, b) => {
+          const tsA = a.timestamp || 0;
+          const tsB = b.timestamp || 0;
+          if (tsA !== tsB) return tsB - tsA;
+          const idA = parseInt(a.id, 10) || 0;
+          const idB = parseInt(b.id, 10) || 0;
+          return idB - idA;
+        });
+        return discussions;
+      }
+    } catch (domErr) {
+      console.warn("DOMParser error in parseForumDiscussions, falling back to regex:", domErr);
+    }
+  }
+
+  // Method 2: Regex Parser (for Service Worker context where DOMParser is undefined)
+  const seenDiscIds = new Set();
+  const topicRegex = /<a[^>]*href="([^"]*discuss\.php\?d=(\d+)[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+
+  while ((match = topicRegex.exec(html)) !== null) {
+    let url = match[1];
+    const discussionId = match[2];
+    let rawSubject = match[3].replace(/<[^>]+>/g, "").trim();
+
+    if (!rawSubject || seenDiscIds.has(discussionId)) continue;
+    seenDiscIds.add(discussionId);
+
+    if (!url.startsWith("http")) {
+      url = "https://spectrum.um.edu.my/" + url.replace(/^\//, "");
+    }
+
+    discussions.push({
+      id: discussionId,
+      courseCode,
+      subject: rawSubject,
+      author: "Course Instructor",
+      date: "Recent",
+      url,
+      timestamp: parseNoticeTimestamp("", discussionId)
+    });
+  }
+
+  discussions.sort((a, b) => {
+    const tsA = a.timestamp || 0;
+    const tsB = b.timestamp || 0;
+    if (tsA !== tsB) return tsB - tsA;
+    const idA = parseInt(a.id, 10) || 0;
+    const idB = parseInt(b.id, 10) || 0;
+    return idB - idA;
+  });
+
+  return discussions;
+}
+
+
+/**
+ * Calculates current academic week (Week 1 through Week 14)
+ * UM typically operates on a 14-week semester system:
+ * - Weeks 1 to 7: Lectures
+ * - Mid-Semester Break: 1 week
+ * - Weeks 8 to 14: Lectures
+ * - Revision Week: 1 week
+ * - Final Exams: 2-3 weeks
+ */
+export function calculateAcademicWeek(semesterStartDateStr = null) {
+  const now = new Date();
+  let start = semesterStartDateStr ? new Date(semesterStartDateStr) : null;
+
+  // Fallback: estimate semester start (Semester 1 around Oct 1, Semester 2 around March 1)
+  if (!start || isNaN(start.getTime())) {
+    const curYear = now.getFullYear();
+    const curMonth = now.getMonth(); // 0-indexed (9 = Oct)
+    if (curMonth >= 8 || curMonth <= 1) {
+      // Semester 1 (roughly Oct 1st)
+      const yr = curMonth <= 1 ? curYear - 1 : curYear;
+      start = new Date(yr, 9, 6); // First Monday of October
+    } else {
+      // Semester 2 (roughly March 1st)
+      start = new Date(curYear, 2, 2); // Early March
+    }
+  }
+
+  const diffDays = Math.floor((now.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+  if (diffDays < 0) {
+    return { week: 1, isBreak: false, label: "Orientation / Pre-Semester" };
+  }
+
+  const weekNumber = Math.floor(diffDays / 7) + 1;
+
+  if (weekNumber <= 7) {
+    return { week: weekNumber, isBreak: false, label: `Week ${weekNumber}` };
+  } else if (weekNumber === 8) {
+    return { week: 7, isBreak: true, label: "Mid-Semester Break" };
+  } else if (weekNumber <= 15) {
+    const adjWeek = weekNumber - 1; // offset for 1-week mid-sem break
+    return { week: Math.min(adjWeek, 14), isBreak: false, label: `Week ${Math.min(adjWeek, 14)}` };
+  } else if (weekNumber === 16) {
+    return { week: 14, isBreak: false, label: "Revision Week" };
+  } else {
+    return { week: 14, isBreak: false, label: "Final Examination Period" };
+  }
+}
+
+/**
+ * Extracts all occurrence and group numbers declared in a string.
+ * Handles:
+ * - Hyphen/slash/comma separated lists: "(OCC3-OCC5-OCC8-OCC9)", "OCC 1, 2, 3", "OCC1/OCC2"
+ * - Ranges: "OCC 1 - OCC 4", "OCC 1-4", "OCC 1 to 4", "Group 1-3"
+ * - Multi-tokens: "Attendance Lecture Group 2 (OCC3-OCC5-OCC8-OCC9)" -> [2, 3, 5, 8, 9]
+ * - Standalone numbers or pure digits: "01", "3", "Occ 2"
+ */
+export function extractAllOccurrenceNumbers(text) {
+  if (!text) return [];
+  const str = String(text).toLowerCase();
+  const numbers = new Set();
+
+  // 1. Check for explicit ranges: e.g. "occ 1 to 4", "occ 1 to occ 4", "group 1 hingga 3", or "group 1-3" / "occ 1-4"
+  const rangeWordRegex = /\b(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?|lecture\s+group|lec\s+group|kumpulan\s+kuliah)\s*#?\s*0*(\d+)\s*(?:to|hingga|sampai)\s*(?:(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?|lecture\s+group|lec\s+group|kumpulan\s+kuliah)\s*#?\s*)?0*(\d+)\b/gi;
+  let rangeMatch;
+  while ((rangeMatch = rangeWordRegex.exec(str)) !== null) {
+    const start = parseInt(rangeMatch[1], 10);
+    const end = parseInt(rangeMatch[2], 10);
+    if (!isNaN(start) && !isNaN(end) && end >= start && end - start <= 20) {
+      for (let n = start; n <= end; n++) numbers.add(n);
+    }
+  }
+
+  // Pure hyphen range without prefix on second number: e.g. "group 1-3" or "occ 1-4" (not "occ3-occ5")
+  const hyphenRangeRegex = /\b(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?)\s*#?\s*0*(\d+)\s*-\s*0*(\d+)\b(?!\s*-\s*(?:occ|group|kump|\d))/gi;
+  while ((rangeMatch = hyphenRangeRegex.exec(str)) !== null) {
+    const start = parseInt(rangeMatch[1], 10);
+    const end = parseInt(rangeMatch[2], 10);
+    if (!isNaN(start) && !isNaN(end) && end >= start && end - start <= 20) {
+      for (let n = start; n <= end; n++) numbers.add(n);
+    }
+  }
+
+  // 2. Check for tokens with explicit occurrence/group prefixes:
+  // e.g. "Group 2", "OCC3", "OCC5", "kumpulan 1", "tutorial 3", "Lecture Group 2"
+  const tokenRegex = /(?:\b(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?|lecture\s+group|lec\s+group|kumpulan\s+kuliah)\s*#?\s*|\b[ktg]\s*#?\s*)0*(\d+)\b/gi;
+  let tokenMatch;
+  while ((tokenMatch = tokenRegex.exec(str)) !== null) {
+    const n = parseInt(tokenMatch[1], 10);
+    if (!isNaN(n)) numbers.add(n);
+  }
+
+  // 3. Check for lists following an occurrence prefix, e.g. "OCC 3, 5, 8, 9", "OCC 3, 4, 5, 6, and 7", or "OCC3-5-8-9"
+  const listAfterPrefixRegex = /\b(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?|lecture\s+group|lec\s+group|kumpulan\s+kuliah)\s*#?\s*0*(\d+)(?:(?:\s*[,/&-]\s*|\s+(?:and|dan)\s*|\s*,\s*(?:and|dan)\s*)\s*0*(\d+))+/gi;
+  let listMatch;
+  while ((listMatch = listAfterPrefixRegex.exec(str)) !== null) {
+    const subDigits = listMatch[0].match(/\b0*(\d+)\b/g);
+    if (subDigits) {
+      subDigits.forEach((d) => {
+        const n = parseInt(d, 10);
+        if (!isNaN(n)) numbers.add(n);
+      });
+    }
+  }
+
+  // 4. If the string is purely numeric or just a number with padding, e.g. "01", "1", "2"
+  const pureNumMatch = str.trim().match(/^0*(\d+)$/);
+  if (pureNumMatch) {
+    const n = parseInt(pureNumMatch[1], 10);
+    if (!isNaN(n)) numbers.add(n);
+  }
+
+  return Array.from(numbers);
+}
+
+/**
+ * Matches a session's group/type string against a student's configured occurrence
+ */
+export function matchesOccurrence(sessionGroup, studentOccurrence, sessionDescription = "", activityName = "") {
+  return isRespectiveOccurrence(sessionGroup, studentOccurrence, sessionDescription, activityName);
+}
+
+/**
+ * Strict occurrence checker:
+ * Ensures attendance is only filled/recorded for the student's respective occurrence.
+ * - Universal groups ("All students", "Semua pelajar", empty) match everyone.
+ * - Multi-occurrence lecture groups (e.g. "Attendance Lecture Group 2 (OCC3-OCC5-OCC8-OCC9)")
+ *   match students enrolled in Group 2, OCC 3, OCC 5, OCC 8, or OCC 9.
+ * - If session or activityName specifies a group (e.g. "Occ 1", "Occ 2") or mentions it in description,
+ *   student must have configured that exact occurrence.
+ * - If student has NOT configured an occurrence, group-specific sessions will NOT match.
+ */
+export function isRespectiveOccurrence(sessionGroup, studentOccurrence, sessionDescription = "", activityName = "") {
+  const group = (sessionGroup || "").trim().toLowerCase();
+  const desc = (sessionDescription || "").trim().toLowerCase();
+  const actName = (activityName || "").trim().toLowerCase();
+  const occ = (studentOccurrence || "").trim().toLowerCase();
+
+  // If student occurrence is 'all', matches everything for full auto-checkin
+  if (occ === "all") {
+    return true;
+  }
+
+  const studentNumbers = extractAllOccurrenceNumbers(occ);
+  const hasStudentOcc = studentNumbers.length > 0 || Boolean(occ && occ !== "all");
+
+  // Step 1: Check Activity Name
+  // If activityName explicitly declares one or more occurrences / groups:
+  const actNumbers = extractAllOccurrenceNumbers(actName);
+  if (actNumbers.length > 0) {
+    if (!hasStudentOcc) {
+      // Activity is group-specific, but student has no occurrence configured
+      return false;
+    }
+    // Student must match at least one of the occurrences declared in the activity name
+    const matchesAct = studentNumbers.some((n) => actNumbers.includes(n));
+    if (!matchesAct) {
+      // Activity specifically belongs to another occurrence / group!
+      return false;
+    }
+  }
+
+  // Step 2: Check Session Group and Session Description
+  const groupIsUniversal = !group || group.includes("all students") || group.includes("semua pelajar") || group === "all";
+
+  // Check group column numbers (if not universal)
+  const groupNumbers = !groupIsUniversal ? extractAllOccurrenceNumbers(group) : [];
+
+  // Check description numbers
+  const descNumbers = extractAllOccurrenceNumbers(desc);
+
+  const sessionNumbers = groupNumbers.length > 0 ? groupNumbers : descNumbers;
+
+  if (sessionNumbers.length > 0) {
+    if (!hasStudentOcc) {
+      // Session row is group-specific, but student has no occurrence configured
+      return false;
+    }
+    const matchesSession = studentNumbers.some((n) => sessionNumbers.includes(n));
+    if (!matchesSession) {
+      return false;
+    }
+    return true;
+  }
+
+  // If group is not universal and had no numbers, check textual match
+  if (!groupIsUniversal && group) {
+    if (!hasStudentOcc) return false;
+    const safeOcc = occ.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`\\b${safeOcc}\\b`, "i");
+    return regex.test(group) || group.includes(occ);
+  }
+
+  // If session is universal, and activity either matched or had no occurrence:
+  return true;
+}
+
+/**
+ * Parses SPeCTRUM /mod/attendance/index.php?id={courseId} or course view
+ * Discovers ALL attendance instances in the course, from top to bottom of page.
+ */
+export function parseAttendanceIndex(html) {
+  if (!html) return [];
+  const links = [];
+  const seenCmids = new Set();
+
+  function addInstance(cmid, name, rawUrl) {
+    if (!cmid || seenCmids.has(cmid)) return;
+    seenCmids.add(cmid);
+    const fullUrl = rawUrl.startsWith("http") ? rawUrl : `https://spectrum.um.edu.my/${rawUrl.replace(/^\//, "")}`;
+    links.push({
+      cmid: String(cmid),
+      name: (name || "Attendance").trim().replace(/^(Activity|Aktiviti)\s+/i, ""),
+      url: fullUrl
+    });
+  }
+
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+
+      // 1. Look for view.php links anywhere on the page
+      const aEls = doc.querySelectorAll("a[href*='mod/attendance/view.php']");
+      aEls.forEach((a) => {
+        const href = a.getAttribute("href") || "";
+        const idMatch = href.match(/id=(\d+)/);
+        if (idMatch) {
+          const text = a.textContent.trim() || a.getAttribute("title") || "Attendance";
+          addInstance(idMatch[1], text, href);
+        }
+      });
+
+      // 2. Look for modtype_attendance containers across all sections (top to bottom)
+      const actContainers = doc.querySelectorAll(".modtype_attendance, li.activity.attendance, div.activityinstance");
+      actContainers.forEach((el) => {
+        const a = el.querySelector("a[href*='mod/attendance/']");
+        if (a) {
+          const href = a.getAttribute("href") || "";
+          const idMatch = href.match(/id=(\d+)/);
+          if (idMatch) {
+            const text = a.textContent.trim() || el.querySelector(".instancename")?.textContent?.trim() || "Attendance";
+            addInstance(idMatch[1], text, href);
+          }
+        }
+      });
+
+      if (links.length > 0) return links;
+    } catch (e) { }
+  }
+
+  // Regex fallback
+  const regex = /<a[^>]+href=["']([^"']*mod\/attendance\/view\.php\?id=(\d+)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    const rawUrl = match[1];
+    const cmid = match[2];
+    const name = match[3].replace(/<[^>]+>/g, "").trim() || "Attendance";
+    addInstance(cmid, name, rawUrl);
+  }
+
+  return links;
+}
+
+/**
+ * Parses all attendance tabs and group selectors from SPeCTRUM /mod/attendance/view.php
+ * Extracts:
+ * - View mode tabs (All [view=5], All Past [view=4], Months [view=3], Weeks [view=2], Days [view=1])
+ * - Group/occurrence tabs and dropdown options (e.g. Occ 1, Occ 2, Group 1)
+ */
+export function parseAttendanceTabs(html, cmid, baseUrl = "https://spectrum.um.edu.my") {
+  if (!html) return [];
+  const tabs = [];
+  const seenUrls = new Set();
+
+  function addTab(label, rawUrl, isGroup = false) {
+    if (!rawUrl) return;
+    const fullUrl = rawUrl.startsWith("http") ? rawUrl : `${baseUrl}/${rawUrl.replace(/^\//, "")}`;
+    if (!seenUrls.has(fullUrl)) {
+      seenUrls.add(fullUrl);
+      tabs.push({
+        label: (label || "").trim(),
+        url: fullUrl,
+        isGroup
+      });
+    }
+  }
+
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+
+      // Tab navigation: nav-tabs, nav-pills, tabtree, attendance-tabs, ul.nav, etc.
+      const tabLinks = doc.querySelectorAll(
+        ".nav-tabs a, .nav-pills a, .tabtree a, .attendance-tabs a, ul.nav a, a[href*='mod/attendance/view.php']"
+      );
+      tabLinks.forEach((a) => {
+        const href = a.getAttribute("href") || "";
+        const label = a.textContent.trim();
+        if (href && (href.includes("view=") || href.includes("group=") || href.includes("curdate="))) {
+          addTab(label, href, href.includes("group="));
+        }
+      });
+
+      // Group select dropdowns: <select name="group">
+      const groupSelects = doc.querySelectorAll("select[name='group']");
+      groupSelects.forEach((select) => {
+        select.querySelectorAll("option").forEach((opt) => {
+          const val = opt.getAttribute("value");
+          const label = opt.textContent.trim();
+          if (val && val !== "0" && cmid) {
+            addTab(label, `/mod/attendance/view.php?id=${cmid}&group=${val}&view=5`, true);
+          }
+        });
+      });
+
+      if (tabs.length > 0) return tabs;
+    } catch (e) { }
+  }
+
+  // Regex fallback
+  const tabRegex = /<a[^>]+href=["']([^"']*mod\/attendance\/view\.php\?[^"']*(?:view=|group=)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = tabRegex.exec(html)) !== null) {
+    const rawUrl = m[1];
+    const label = m[2].replace(/<[^>]+>/g, "").trim();
+    addTab(label, rawUrl, rawUrl.includes("group="));
+  }
+
+  const optRegex = /<option[^>]+value=["'](\d+)["'][^>]*>([\s\S]*?)<\/option>/gi;
+  let optM;
+  while ((optM = optRegex.exec(html)) !== null) {
+    const val = optM[1];
+    const label = optM[2].replace(/<[^>]+>/g, "").trim();
+    if (val !== "0" && cmid) {
+      addTab(label, `/mod/attendance/view.php?id=${cmid}&group=${val}&view=5`, true);
+    }
+  }
+
+  return tabs;
+}
+
+/**
+ * Extracts hour and minute (24-hour format) from time string
+ * Supports "2:00PM", "14:00", "2PM", "02:00 PM - 04:00 PM", "8.30 AM", etc.
+ */
+export function extractStartTime(timeStr) {
+  if (!timeStr) return null;
+  const str = String(timeStr).replace(/\u00a0/g, " ").trim();
+  const m = str.match(/(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)?/i);
+  if (!m) return null;
+
+  let hour = parseInt(m[1], 10);
+  const min = m[2] ? parseInt(m[2], 10) : 0;
+  const ampm = m[3] ? m[3].toLowerCase() : null;
+
+  if (ampm === "pm" && hour < 12) hour += 12;
+  else if (ampm === "am" && hour === 12) hour = 0;
+
+  return { hour, min };
+}
+
+/**
+ * Normalizes and parses SPeCTRUM attendance date strings
+ * Supports English and Bahasa Melayu dates, dates without year, Today / Hari ini, as well as DD/MM/YYYY, DD.MM.YYYY, and DD-MM-YYYY.
+ */
+export function parseAttendanceSessionDate(dateText, timeText = "", referenceDate = new Date()) {
+  if (!dateText) return null;
+
+  const ref = new Date(referenceDate || new Date());
+  const currentYear = ref.getFullYear();
+
+  let raw = String(dateText).replace(/\u00a0/g, " ").trim();
+  const parsedTime = extractStartTime(timeText) || extractStartTime(raw);
+
+  const lower = raw.toLowerCase();
+  // Check for today / hari ini
+  if (lower.includes("today") || lower.includes("hari ini")) {
+    const d = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate());
+    if (parsedTime) {
+      d.setHours(parsedTime.hour, parsedTime.min, 0, 0);
+    }
+    return d.getTime();
+  }
+
+  // Check for yesterday / semalam
+  if (lower.includes("yesterday") || lower.includes("semalam")) {
+    const d = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate() - 1);
+    if (parsedTime) {
+      d.setHours(parsedTime.hour, parsedTime.min, 0, 0);
+    }
+    return d.getTime();
+  }
+
+  let cleaned = raw
+    // Strip day names (English & Malay)
+    .replace(/\b(isnin|selasa|rabu|khamis|jumaat|sabtu|ahad)\b/gi, "")
+    .replace(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, "")
+    .replace(/\b(mon|tue|wed|thu|fri|sat|sun)\b/gi, "")
+    // Normalize Malay months to English abbreviations
+    .replace(/\bjan(?:uari)?\b/gi, "Jan")
+    .replace(/\bfeb(?:ruari)?\b/gi, "Feb")
+    .replace(/\bmac\b/gi, "Mar")
+    .replace(/\bapr(?:il)?\b/gi, "Apr")
+    .replace(/\bmei\b/gi, "May")
+    .replace(/\bjun\b/gi, "Jun")
+    .replace(/\bjul(?:ai)?\b/gi, "Jul")
+    .replace(/\bogo(?:s)?\b/gi, "Aug")
+    .replace(/\bsep(?:tember)?\b/gi, "Sep")
+    .replace(/\bokt(?:ober)?\b/gi, "Oct")
+    .replace(/\bnov(?:ember)?\b/gi, "Nov")
+    .replace(/\bdis(?:ember)?\b/gi, "Dec")
+    // Clean unwanted characters and symbols like commas, brackets, etc.
+    .replace(/[,\(\)]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // 1. Try DD/MM/YYYY or DD.MM.YYYY or DD-MM-YYYY or DD/MM/YY
+  const slashMatch = cleaned.match(/^(\d{1,2})[\.\/\-](\d{1,2})(?:[\.\/\-](\d{2,4}))?/);
+  if (slashMatch) {
+    const day = parseInt(slashMatch[1], 10);
+    const month = parseInt(slashMatch[2], 10) - 1;
+    let year = slashMatch[3] ? parseInt(slashMatch[3], 10) : currentYear;
+    if (year < 100) year += 2000;
+    const d = new Date(year, month, day);
+    if (parsedTime) {
+      d.setHours(parsedTime.hour, parsedTime.min, 0, 0);
+    }
+    const parsedTs = d.getTime();
+    if (!isNaN(parsedTs)) return parsedTs;
+  }
+
+  // 2. Try YYYY-MM-DD
+  const isoMatch = cleaned.match(/^(\d{4})[\.\/\-](\d{1,2})[\.\/\-](\d{1,2})/);
+  if (isoMatch) {
+    const year = parseInt(isoMatch[1], 10);
+    const month = parseInt(isoMatch[2], 10) - 1;
+    const day = parseInt(isoMatch[3], 10);
+    const d = new Date(year, month, day);
+    if (parsedTime) {
+      d.setHours(parsedTime.hour, parsedTime.min, 0, 0);
+    }
+    const parsedTs = d.getTime();
+    if (!isNaN(parsedTs)) return parsedTs;
+  }
+
+  // 3. Try DD Month (e.g. "20 Oct" or "20 Oct 2026")
+  const monthNames = {
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
+  };
+  const wordMatch = cleaned.match(/(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{2,4}))?/);
+  if (wordMatch) {
+    const day = parseInt(wordMatch[1], 10);
+    const monStr = wordMatch[2].slice(0, 3).toLowerCase();
+    if (monthNames[monStr] !== undefined) {
+      let year = wordMatch[3] ? parseInt(wordMatch[3], 10) : currentYear;
+      if (year < 100) year += 2000;
+      const d = new Date(year, monthNames[monStr], day);
+      if (parsedTime) {
+        d.setHours(parsedTime.hour, parsedTime.min, 0, 0);
+      }
+      const parsedTs = d.getTime();
+      if (!isNaN(parsedTs)) return parsedTs;
+    }
+  }
+
+  // 4. Try Month DD, YYYY (e.g. "October 20 2026")
+  const monthFirstMatch = cleaned.match(/([A-Za-z]+)\s+(\d{1,2})(?:[\s,]+(\d{2,4}))?/);
+  if (monthFirstMatch) {
+    const monStr = monthFirstMatch[1].slice(0, 3).toLowerCase();
+    const day = parseInt(monthFirstMatch[2], 10);
+    if (monthNames[monStr] !== undefined) {
+      let year = monthFirstMatch[3] ? parseInt(monthFirstMatch[3], 10) : currentYear;
+      if (year < 100) year += 2000;
+      const d = new Date(year, monthNames[monStr], day);
+      if (parsedTime) {
+        d.setHours(parsedTime.hour, parsedTime.min, 0, 0);
+      }
+      const parsedTs = d.getTime();
+      if (!isNaN(parsedTs)) return parsedTs;
+    }
+  }
+
+  // 5. Fallback: If year is missing in string, append current year and try native parse
+  if (!/\b\d{4}\b/.test(cleaned)) {
+    cleaned = `${cleaned} ${currentYear}`;
+  }
+
+  let ts = Date.parse(cleaned);
+  if (!isNaN(ts)) {
+    if (parsedTime) {
+      const d = new Date(ts);
+      d.setHours(parsedTime.hour, parsedTime.min, 0, 0);
+      return d.getTime();
+    }
+    return ts;
+  }
+
+  return null;
+}
+
+/**
+ * Checks whether an attendance session is scheduled on or before the current date.
+ * - Open sessions are currently active today -> true
+ * - Already recorded sessions (present, late, absent, excused) have already occurred -> true
+ * - Today's sessions (regardless of time, e.g. 2pm when it's 12pm) -> true
+ * - Future unrecorded sessions (date > current date) -> false
+ */
+export function isAttendanceSessionPastOrCurrent(dateText, timeText = "", status = "", referenceDate = new Date()) {
+  if (status === "open" || status === "present" || status === "late" || status === "absent" || status === "excused" || status === "today") {
+    return true;
+  }
+
+  const rawLower = String(dateText || "").toLowerCase();
+  if (rawLower.includes("today") || rawLower.includes("hari ini")) {
+    return true;
+  }
+
+  const ts = parseAttendanceSessionDate(dateText, timeText, referenceDate);
+  if (!ts) {
+    // If unrecorded session date cannot be parsed, strictly exclude from past/current
+    return false;
+  }
+
+  const ref = new Date(referenceDate || new Date());
+  const endOfRefDate = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate(), 23, 59, 59, 999).getTime();
+
+  return ts <= endOfRefDate;
+}
+
+/**
+ * Parses SPeCTRUM /mod/attendance/view.php?id={cmid}
+ * Extracts session rows, attendance status, open self-recording links, and statistical summaries.
+ * STRICT REQUIREMENT: Only includes attendance sessions from the first date till the current date.
+ */
+export function parseAttendanceView(html, studentOccurrence = "", referenceDate = new Date(), activityName = "") {
+  if (!html) {
+    return {
+      summary: { takenSessions: 0, points: "0 / 0", percentage: "0.0%", presentCount: 0, absentCount: 0, lateCount: 0, excusedCount: 0, unrecordedCount: 0 },
+      sessions: [],
+      hasOpenSession: false,
+      openSession: null
+    };
+  }
+
+  const sessions = [];
+  let summary = {
+    takenSessions: 0,
+    points: "0 / 0",
+    percentage: "0.0%",
+    presentCount: 0,
+    absentCount: 0,
+    lateCount: 0,
+    excusedCount: 0,
+    unrecordedCount: 0
+  };
+
+  const ref = new Date(referenceDate || new Date());
+
+  // 1. DOMParser Method (Browser / Popup)
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+
+      // Extract Sessions Table
+      const tables = doc.querySelectorAll("table.attlist, table.generaltable");
+      tables.forEach((table) => {
+        let colDate = -1;
+        let colTime = -1;
+        let colGroup = -1;
+        let colDesc = -1;
+        let colStatus = -1;
+        let colPoints = -1;
+        let colRemarks = -1;
+
+        const ths = table.querySelectorAll("th");
+        ths.forEach((th, i) => {
+          const h = th.textContent.trim().toLowerCase();
+          if (h.includes("date") || h.includes("tarikh")) colDate = i;
+          else if (h.includes("time") || h.includes("masa")) colTime = i;
+          else if (h.includes("group") || h.includes("kumpulan") || h.includes("type") || h.includes("jenis")) colGroup = i;
+          else if (h.includes("desc") || h.includes("keterangan") || h.includes("deskripsi")) colDesc = i;
+          else if (h.includes("status") || h.includes("keadaan")) colStatus = i;
+          else if (h.includes("point") || h.includes("mata") || h.includes("markah") || h.includes("score")) colPoints = i;
+          else if (h.includes("remark") || h.includes("catatan") || h.includes("nota")) colRemarks = i;
+        });
+
+        const rows = table.querySelectorAll("tbody tr, tr");
+        rows.forEach((tr, idx) => {
+          const cells = tr.querySelectorAll("td");
+          if (cells.length < 3) return; // Header or empty row
+
+          let curColDate = colDate;
+          let curColTime = colTime;
+          let curColGroup = colGroup;
+          let curColDesc = colDesc;
+          let curColStatus = colStatus;
+          let curColPoints = colPoints;
+          let curColRemarks = colRemarks;
+
+          if (curColDate === -1 || curColStatus === -1) {
+            if (cells.length === 5) {
+              const c2Text = cells[2]?.textContent?.trim() || "";
+              const c3Text = cells[3]?.textContent?.trim() || "";
+              const c2HasLink = Boolean(cells[2]?.querySelector("a[href*='attendance.php']"));
+              if (c2HasLink || /present|hadir|late|lewat|absent|tidak hadir|excused|dimaafkan|submit|record|unrecorded/i.test(c2Text) || /\d+\s*\/\s*\d+/.test(c3Text)) {
+                // 5 cols: Date (+embedded Time) | Description | Status | Points | Remarks
+                curColDate = 0;
+                curColTime = -1;
+                curColGroup = -1;
+                curColDesc = 1;
+                curColStatus = 2;
+                curColPoints = 3;
+                curColRemarks = 4;
+              } else {
+                // 5 cols: Date | Time | Description | Status | Points
+                curColDate = 0;
+                curColTime = 1;
+                curColGroup = -1;
+                curColDesc = 2;
+                curColStatus = 3;
+                curColPoints = 4;
+                curColRemarks = -1;
+              }
+            } else if (cells.length === 4) {
+              curColDate = 0;
+              curColTime = -1;
+              curColGroup = -1;
+              curColDesc = 1;
+              curColStatus = 2;
+              curColPoints = 3;
+              curColRemarks = -1;
+            } else if (cells.length >= 6) {
+              curColDate = 0;
+              curColTime = 1;
+              const c2Text = cells[2]?.textContent?.trim() || "";
+              if (/group|occ|kump|all students|semua pelajar/i.test(c2Text)) {
+                curColGroup = 2;
+                curColDesc = 3;
+                curColStatus = 4;
+                curColPoints = 5;
+                curColRemarks = cells.length >= 7 ? 6 : -1;
+              } else {
+                curColGroup = -1;
+                curColDesc = 2;
+                curColStatus = 3;
+                curColPoints = 4;
+                curColRemarks = 5;
+              }
+            } else {
+              curColDate = 0;
+              curColTime = 1;
+              curColDesc = 2;
+              curColStatus = cells.length > 3 ? 3 : -1;
+              curColPoints = cells.length > 4 ? 4 : -1;
+            }
+          }
+
+          let dateText = (curColDate >= 0 ? cells[curColDate]?.textContent?.trim() : "") || "Session";
+          let timeText = (curColTime >= 0 ? cells[curColTime]?.textContent?.trim() : "") || "";
+          const groupText = (curColGroup >= 0 ? cells[curColGroup]?.textContent?.trim() : "") || "All students";
+          const descText = (curColDesc >= 0 ? cells[curColDesc]?.textContent?.trim() : "") || "";
+          const statusCell = curColStatus >= 0 ? cells[curColStatus] : null;
+          const pointsCell = curColPoints >= 0 ? cells[curColPoints] : null;
+          const remarksCell = curColRemarks >= 0 ? cells[curColRemarks] : null;
+
+          // If time is missing or embedded in dateText (e.g. "Mon 12 Oct 2026 2PM - 4PM")
+          if (!timeText || curColTime === -1) {
+            const timeInDateMatch = dateText.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*[-–—]\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?|\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))\b/i);
+            if (timeInDateMatch) {
+              timeText = timeInDateMatch[0];
+              dateText = dateText.replace(timeInDateMatch[0], "").trim();
+            }
+          }
+
+          const statusRaw = statusCell?.textContent?.trim() || "";
+          const pointsText = pointsCell?.textContent?.trim() || "";
+          const remarksText = remarksCell?.textContent?.trim() || "";
+
+          // Check for self-recording submit link
+          const submitLinkEl = tr.querySelector("a[href*='attendance.php?sessid='], a[href*='mod/attendance/attendance.php']");
+          const submitUrl = submitLinkEl ? (
+            submitLinkEl.getAttribute("href").startsWith("http")
+              ? submitLinkEl.getAttribute("href")
+              : `https://spectrum.um.edu.my/${submitLinkEl.getAttribute("href").replace(/^\//, "")}`
+          ) : null;
+
+          const sessidMatch = (submitUrl || tr.innerHTML).match(/sessid=(\d+)/);
+          const sessid = sessidMatch ? sessidMatch[1] : `sess_${idx}`;
+
+          let status = "unrecorded";
+          let statusLabel = statusRaw || "Unrecorded";
+
+          if (submitUrl || /submit|record|daftar/i.test(statusRaw)) {
+            status = "open";
+            statusLabel = "Open for Check-In";
+          } else if (/present|hadir/i.test(statusRaw)) {
+            status = "present";
+            statusLabel = "Present";
+          } else if (/late|lewat/i.test(statusRaw)) {
+            status = "late";
+            statusLabel = "Late";
+          } else if (/absent|tidak hadir/i.test(statusRaw)) {
+            status = "absent";
+            statusLabel = "Absent";
+          } else if (/excused|dimaafkan/i.test(statusRaw)) {
+            status = "excused";
+            statusLabel = "Excused";
+          }
+
+          const isMatch = matchesOccurrence(groupText, studentOccurrence, descText, activityName);
+          const sessionTs = parseAttendanceSessionDate(dateText, timeText, referenceDate);
+          const isPastOrCurrent = isAttendanceSessionPastOrCurrent(dateText, timeText, status, referenceDate);
+
+          // Check if session is on the current date (today)
+          const isToday = Boolean(
+            String(dateText).toLowerCase().includes("today") ||
+            String(dateText).toLowerCase().includes("hari ini") ||
+            (sessionTs && (
+              new Date(sessionTs).getFullYear() === ref.getFullYear() &&
+              new Date(sessionTs).getMonth() === ref.getMonth() &&
+              new Date(sessionTs).getDate() === ref.getDate()
+            ))
+          );
+
+          if (status === "unrecorded" && isToday) {
+            status = "today";
+            const startT = timeText ? timeText.split("-")[0].trim() : "";
+            statusLabel = startT ? `Scheduled Today (${startT})` : "Scheduled Today";
+          }
+
+          sessions.push({
+            id: sessid,
+            sessid,
+            date: dateText,
+            time: timeText,
+            timestamp: sessionTs,
+            isToday,
+            isPastOrCurrent,
+            group: groupText,
+            description: descText,
+            activityName,
+            status,
+            statusLabel,
+            points: pointsText,
+            remarks: remarksText,
+            submitUrl,
+            matchesOccurrence: isMatch
+          });
+        });
+      });
+
+      // Extract Summary Stats from page
+      const summaryTable = doc.querySelector(".attwidth, .generaltable.attwidth");
+      if (summaryTable) {
+        summaryTable.querySelectorAll("tr").forEach((row) => {
+          const text = row.textContent.toLowerCase();
+          const val = row.querySelector("td:last-child")?.textContent?.trim() || "";
+          if (text.includes("taken session") || text.includes("sesi diambil")) {
+            summary.takenSessions = parseInt(val, 10) || summary.takenSessions;
+          } else if (text.includes("point") || text.includes("mata")) {
+            summary.points = val || summary.points;
+          } else if (text.includes("percentage") || text.includes("peratus")) {
+            summary.percentage = val.includes("%") ? val : `${val}%`;
+          }
+        });
+      }
+
+      const pageText = (doc.body?.textContent || html);
+      const takenMatch = pageText.match(/(?:taken sessions?|sesi diambil)\s*:\s*(\d+)/i);
+      if (takenMatch && !summary.takenSessions) {
+        summary.takenSessions = parseInt(takenMatch[1], 10);
+      }
+      const pointsMatch = pageText.match(/(?:points(?: over taken sessions)?|mata(?: atas sesi diambil)?)\s*:\s*([0-9\.\s\/]+)/i);
+      if (pointsMatch && (!summary.points || summary.points === "0 / 0")) {
+        summary.points = pointsMatch[1].trim();
+      }
+      const pctMatch = pageText.match(/(?:percentage(?: over taken sessions)?|peratus(?: atas sesi diambil)?)\s*:\s*([0-9\.]+\s*%?)/i);
+      if (pctMatch && (!summary.percentage || summary.percentage === "0.0%")) {
+        const p = pctMatch[1].trim();
+        summary.percentage = p.includes("%") ? p : `${p}%`;
+      }
+    } catch (e) {
+      console.warn("[Spectra Parser] DOM attendance parsing error:", e);
+    }
+  }
+
+  // 2. Regex Method Fallback (if DOMParser is not available or returned 0 sessions)
+  if (sessions.length === 0) {
+    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let rowMatch;
+    let idx = 0;
+    while ((rowMatch = rowRegex.exec(html)) !== null) {
+      const rowContent = rowMatch[1];
+      const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+      const cells = [];
+      let cellMatch;
+      while ((cellMatch = cellRegex.exec(rowContent)) !== null) {
+        cells.push(cellMatch[1].replace(/<[^>]+>/g, "").trim());
+      }
+
+      if (cells.length < 3) continue;
+
+      let dateText = cells[0] || "Session";
+      let timeText = "";
+      let groupText = "All students";
+      let descText = "";
+      let statusRaw = "";
+      let pointsText = "";
+      let remarksText = "";
+
+      if (cells.length === 5) {
+        if (/present|hadir|late|lewat|absent|tidak hadir|excused|dimaafkan|submit|record/i.test(cells[2]) || /\d+\s*\/\s*\d+/.test(cells[3])) {
+          // Date (+time) | Description | Status | Points | Remarks
+          dateText = cells[0];
+          descText = cells[1];
+          statusRaw = cells[2];
+          pointsText = cells[3];
+          remarksText = cells[4];
+        } else {
+          // Date | Time | Description | Status | Points
+          dateText = cells[0];
+          timeText = cells[1];
+          descText = cells[2];
+          statusRaw = cells[3];
+          pointsText = cells[4];
+        }
+      } else if (cells.length === 4) {
+        dateText = cells[0];
+        descText = cells[1];
+        statusRaw = cells[2];
+        pointsText = cells[3];
+      } else if (cells.length >= 6) {
+        timeText = cells[1];
+        if (/group|occ|kump|all students|semua pelajar/i.test(cells[2])) {
+          groupText = cells[2];
+          descText = cells[3];
+          statusRaw = cells[4];
+          pointsText = cells[5];
+          remarksText = cells.length >= 7 ? cells[6] : "";
+        } else {
+          descText = cells[2];
+          statusRaw = cells[3];
+          pointsText = cells[4];
+          remarksText = cells[5] || "";
+        }
+      } else {
+        timeText = cells[1] || "";
+        descText = cells[2] || "";
+        statusRaw = cells[3] || "";
+        pointsText = cells[4] || "";
+      }
+
+      if (!timeText) {
+        const timeInDateMatch = dateText.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*[-–—]\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?|\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))\b/i);
+        if (timeInDateMatch) {
+          timeText = timeInDateMatch[0];
+          dateText = dateText.replace(timeInDateMatch[0], "").trim();
+        }
+      }
+
+      let submitUrl = null;
+      const submitMatch = rowContent.match(/href=["']([^"']*attendance\.php\?sessid=\d+[^"']*)["']/i);
+      if (submitMatch) {
+        submitUrl = submitMatch[1].startsWith("http")
+          ? submitMatch[1]
+          : `https://spectrum.um.edu.my/${submitMatch[1].replace(/^\//, "")}`;
+      }
+
+      const sessidMatch = (submitUrl || rowContent).match(/sessid=(\d+)/);
+      const sessid = sessidMatch ? sessidMatch[1] : `sess_${idx++}`;
+
+      let status = "unrecorded";
+      let statusLabel = statusRaw || "Unrecorded";
+
+      if (submitUrl || /submit|record|daftar/i.test(statusRaw)) {
+        status = "open";
+        statusLabel = "Open for Check-In";
+      } else if (/present|hadir/i.test(statusRaw)) {
+        status = "present";
+        statusLabel = "Present";
+      } else if (/late|lewat/i.test(statusRaw)) {
+        status = "late";
+        statusLabel = "Late";
+      } else if (/absent|tidak hadir/i.test(statusRaw)) {
+        status = "absent";
+        statusLabel = "Absent";
+      } else if (/excused|dimaafkan/i.test(statusRaw)) {
+        status = "excused";
+        statusLabel = "Excused";
+      }
+
+      const isMatch = matchesOccurrence(groupText, studentOccurrence, descText, activityName);
+      const sessionTs = parseAttendanceSessionDate(dateText, timeText, referenceDate);
+      const isPastOrCurrent = isAttendanceSessionPastOrCurrent(dateText, timeText, status, referenceDate);
+
+      // Check if session is on the current date (today)
+      const isToday = Boolean(
+        String(dateText).toLowerCase().includes("today") ||
+        String(dateText).toLowerCase().includes("hari ini") ||
+        (sessionTs && (
+          new Date(sessionTs).getFullYear() === ref.getFullYear() &&
+          new Date(sessionTs).getMonth() === ref.getMonth() &&
+          new Date(sessionTs).getDate() === ref.getDate()
+        ))
+      );
+
+      if (status === "unrecorded" && isToday) {
+        status = "today";
+        const startT = timeText ? timeText.split("-")[0].trim() : "";
+        statusLabel = startT ? `Scheduled Today (${startT})` : "Scheduled Today";
+      }
+
+      sessions.push({
+        id: sessid,
+        sessid,
+        date: dateText,
+        time: timeText,
+        timestamp: sessionTs,
+        isToday,
+        isPastOrCurrent,
+        group: groupText,
+        description: descText,
+        activityName,
+        status,
+        statusLabel,
+        points: pointsText,
+        remarks: remarksText,
+        submitUrl,
+        matchesOccurrence: isMatch
+      });
+    }
+
+    // Regex summary fallback
+    const takenMatch = html.match(/(?:taken sessions?|sesi diambil)[^:]*:?\s*(\d+)/i);
+    if (takenMatch && !summary.takenSessions) summary.takenSessions = parseInt(takenMatch[1], 10);
+
+    const pointsMatch = html.match(/(?:points over taken sessions?|mata sesi diambil)[^:]*:?\s*([\d\s/]+)/i);
+    if (pointsMatch && (!summary.points || summary.points === "0 / 0")) summary.points = pointsMatch[1].trim();
+
+    const pctMatch = html.match(/(?:percentage over taken sessions?|peratus sesi diambil)[^:]*:?\s*([\d.]+)%?/i);
+    if (pctMatch && (!summary.percentage || summary.percentage === "0.0%")) summary.percentage = `${pctMatch[1]}%`;
+  }
+
+  // STRICT REQUIREMENT: Only show the attendance from first till the current date
+  const pastOrCurrentSessions = sessions.filter((s) => s.isPastOrCurrent);
+
+  // Calculate detailed counts based on student's occurrence
+  const isOccSpecified = Boolean(studentOccurrence && studentOccurrence.trim().toLowerCase() !== "all");
+  const relevantSessions = isOccSpecified
+    ? pastOrCurrentSessions.filter((s) => s.matchesOccurrence)
+    : pastOrCurrentSessions;
+  const targetSessions = relevantSessions;
+
+  let present = 0, absent = 0, late = 0, excused = 0, unrecorded = 0;
+  let openSession = null;
+
+  targetSessions.forEach((s) => {
+    if (s.status === "present") present++;
+    else if (s.status === "absent") absent++;
+    else if (s.status === "late") late++;
+    else if (s.status === "excused") excused++;
+    else {
+      unrecorded++;
+    }
+  });
+
+  // STRICT REQUIREMENT: Only select openSession if the session is genuinely OPEN and matches the respective occurrence!
+  for (const s of pastOrCurrentSessions) {
+    if (s.status === "open" && s.submitUrl && isRespectiveOccurrence(s.group, studentOccurrence, s.description, s.activityName || activityName)) {
+      openSession = s;
+      break;
+    }
+  }
+
+  const totalCompleted = present + absent + late + excused;
+  if (totalCompleted > 0 && (!summary.takenSessions || summary.takenSessions === 0)) {
+    summary.takenSessions = totalCompleted;
+    const score = (present * 1.0) + (late * 0.5) + (excused * 1.0);
+    const pct = ((score / totalCompleted) * 100).toFixed(1);
+    summary.percentage = `${pct}%`;
+    summary.points = `${score} / ${totalCompleted}`;
+  }
+
+  summary.presentCount = present;
+  summary.absentCount = absent;
+  summary.lateCount = late;
+  summary.excusedCount = excused;
+  summary.unrecordedCount = unrecorded;
+
+  return {
+    summary,
+    sessions: pastOrCurrentSessions,
+    allSessions: sessions,
+    hasOpenSession: Boolean(openSession),
+    openSession
+  };
+}
+
+/**
+ * Parses SPeCTRUM /mod/attendance/attendance.php form
+ * Extracts the Present status ID and detects password protection.
+ */
+export function parseAttendanceForm(html) {
+  if (!html) return { statusId: null, requiresPassword: false, sesskey: null, sessid: null };
+
+  let statusId = null;
+  let requiresPassword = false;
+  let sesskey = null;
+  let sessid = null;
+
+  // Extract sesskey
+  const sesskeyMatch = html.match(/name=["']sesskey["'][^>]*value=["']([^"']+)["']/i) ||
+    html.match(/value=["']([^"']+)["'][^>]*name=["']sesskey["']/i) ||
+    html.match(/"sesskey":"([^"]+)"/);
+  if (sesskeyMatch) sesskey = sesskeyMatch[1];
+
+  // Extract sessid
+  const sessidMatch = html.match(/name=["']sessid["'][^>]*value=["']([^"']+)["']/i) ||
+    html.match(/value=["']([^"']+)["'][^>]*name=["']sessid["']/i) ||
+    html.match(/sessid=(\d+)/i);
+  if (sessidMatch) sessid = sessidMatch[1];
+
+  // Check if password field exists
+  if (/<input[^>]+name=["'](studentpassword|password)["']/i.test(html) || /<input[^>]+type=["']password["']/i.test(html)) {
+    requiresPassword = true;
+  }
+
+  // 1. DOMParser approach if available (Browser context)
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const presentRadio = Array.from(doc.querySelectorAll('label, span, div'))
+        .find(el => {
+          const txt = el.textContent.trim().toLowerCase();
+          return txt === 'present' || txt === 'hadir';
+        })
+        ?.closest('label')?.querySelector('input[type="radio"]') 
+        || Array.from(doc.querySelectorAll('input[type="radio"]')).find(r => {
+          const id = r.id;
+          const lbl = id ? doc.querySelector(`label[for="${id}"]`) : null;
+          const parentLbl = r.closest('label');
+          const txt = `${lbl?.textContent || ""} ${parentLbl?.textContent || ""} ${r.parentElement?.textContent || ""}`.trim().toLowerCase();
+          return /present|hadir|^p\b/.test(txt);
+        })
+        || doc.querySelector('input[type="radio"]');
+
+      if (presentRadio && presentRadio.value) {
+        statusId = presentRadio.value;
+      }
+    } catch (_) { }
+  }
+
+  // 2. Fallback: Robust regex search across all status radio inputs
+  if (!statusId) {
+    const inputStatusRegex = /<input[^>]*name=["']status["'][^>]*>/gi;
+    let inMatch;
+    while ((inMatch = inputStatusRegex.exec(html)) !== null) {
+      const tagStr = inMatch[0];
+      const valM = tagStr.match(/value=["'](\d+)["']/i);
+      const idM = tagStr.match(/id=["']([^"']+)["']/i);
+      if (!valM) continue;
+      const val = valM[1];
+
+      let isPresent = false;
+      if (idM) {
+        const labelForRegex = new RegExp(`<label[^>]*for=["']${idM[1]}["'][^>]*>([\\s\\S]*?)<\\/label>`, "i");
+        const lMatch = html.match(labelForRegex);
+        if (lMatch && /present|hadir|^p\b/i.test(lMatch[1].replace(/<[^>]+>/g, "").trim())) {
+          isPresent = true;
+        }
+      }
+
+      if (!isPresent) {
+        const afterInput = html.substring(inputStatusRegex.lastIndex, inputStatusRegex.lastIndex + 300);
+        const nextLabelM = afterInput.match(/^[\s\S]*?<label[^>]*>([\s\S]*?)<\/label>/i);
+        if (nextLabelM && /present|hadir|^p\b/i.test(nextLabelM[1].replace(/<[^>]+>/g, "").trim())) {
+          isPresent = true;
+        }
+      }
+
+      if (!isPresent) {
+        const surrounding = html.substring(Math.max(0, inMatch.index - 50), Math.min(html.length, inMatch.index + 200));
+        if (/present|hadir/i.test(surrounding)) {
+          isPresent = true;
+        }
+      }
+
+      if (isPresent) {
+        statusId = val;
+        break;
+      }
+    }
+  }
+
+  // 3. Fallback: If no label matched, pick first status input value
+  if (!statusId) {
+    const anyRadio = html.match(/name=["']status["'][^>]*value=["'](\d+)["']/i) ||
+      html.match(/value=["'](\d+)["'][^>]*name=["']status["']/i);
+    if (anyRadio) statusId = anyRadio[1];
+  }
+
+  return { statusId, requiresPassword, sesskey, sessid };
+}
+
+/**
+ * Helper to parse RFC 5545 iCalendar date-time strings:
+ * Formats: 20241028T155900Z (UTC), 20241028T155900 (local/TZ), 20241028 (date only)
+ */
+export function parseIcsDateTime(str) {
+  if (!str) return null;
+  const s = String(str).trim();
+
+  // Format: YYYYMMDDTHHMMSSZ (UTC)
+  const utcMatch = s.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/i);
+  if (utcMatch) {
+    const [, y, m, d, h, min, sec] = utcMatch;
+    return Date.UTC(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(d, 10), parseInt(h, 10), parseInt(min, 10), parseInt(sec, 10));
+  }
+
+  // Format: YYYYMMDDTHHMMSS (local floating / timezone)
+  const localMatch = s.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/i);
+  if (localMatch) {
+    const [, y, m, d, h, min, sec] = localMatch;
+    return new Date(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(d, 10), parseInt(h, 10), parseInt(min, 10), parseInt(sec, 10)).getTime();
+  }
+
+  // Format: YYYYMMDD (date only, e.g. VALUE=DATE:20241028)
+  const dateMatch = s.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (dateMatch) {
+    const [, y, m, d] = dateMatch;
+    return new Date(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(d, 10), 23, 59, 59).getTime();
+  }
+
+  return null;
+}
+
+/**
+ * Parse standard Moodle RFC 5545 iCalendar (.ics) export stream into unified Spectra deadlines.
+ * Handles line unfolding, timezones (UTC 'Z' or local), course code extraction from CATEGORIES / SUMMARY,
+ * occurrence filtering, attendance activity exclusion, and overdue exclusion.
+ */
+export function parseMoodleIcsCalendar(icsText, studentOccurrencesMap = {}, defaultOccurrence = "") {
+  if (!icsText || typeof icsText !== "string") return [];
+
+  // 1. Line unfolding according to RFC 5545 (lines beginning with space or tab continue previous line)
+  const unfolded = icsText.replace(/\r\n[ \t]|\r[ \t]|\n[ \t]/g, "");
+  const lines = unfolded.split(/\r\n|\r|\n/);
+
+  const events = [];
+  let inEvent = false;
+  let currentEvent = null;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed === "BEGIN:VEVENT") {
+      inEvent = true;
+      currentEvent = {};
+      continue;
+    }
+
+    if (trimmed === "END:VEVENT") {
+      if (inEvent && currentEvent) {
+        events.push(currentEvent);
+      }
+      inEvent = false;
+      currentEvent = null;
+      continue;
+    }
+
+    if (inEvent && currentEvent) {
+      const colonIdx = trimmed.indexOf(":");
+      if (colonIdx === -1) continue;
+
+      const rawKey = trimmed.substring(0, colonIdx);
+      const val = trimmed.substring(colonIdx + 1);
+      const propName = rawKey.split(";")[0].toUpperCase().trim();
+
+      if (!currentEvent[propName]) {
+        currentEvent[propName] = val;
+      }
+    }
+  }
+
+  const deadlines = [];
+
+  for (const ev of events) {
+    const rawSummary = (ev.SUMMARY || "").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\n/g, " ").trim();
+    const rawDesc = (ev.DESCRIPTION || "").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\n/g, "\n").trim();
+    const categories = (ev.CATEGORIES || "").trim();
+    const rawUrl = (ev.URL || "").trim();
+    const uid = (ev.UID || "").trim();
+
+    const dateStr = ev.DTEND || ev.DTSTART || "";
+    if (!dateStr) continue;
+
+    const dueTimestamp = parseIcsDateTime(dateStr);
+    if (!dueTimestamp) continue;
+
+    // Filter: Exclude activities overdue by more than 40 days
+    if (isOverdueMoreThan40Days(dueTimestamp)) continue;
+
+    // Clean title (remove "is due" or "due" suffix commonly appended by Moodle calendar export)
+    let title = rawSummary
+      .replace(/\s+is due(?:\s+to submit)?$/i, "")
+      .replace(/\s+due$/i, "")
+      .trim();
+    title = cleanMoodleTitle(title);
+
+    // Extract Course Code
+    let courseCode = categories ? extractCourseCode(categories) : "";
+    if (!courseCode) {
+      courseCode = extractCourseCode(rawSummary) || extractCourseCode(rawDesc);
+    }
+    if (!courseCode) {
+      courseCode = "Course";
+    }
+
+    // Exclude attendance activities
+    if (isAttendanceActivity({ title, url: rawUrl, type: "calendar" })) {
+      continue;
+    }
+
+    // Filter by student occurrence
+    const studentOcc = studentOccurrencesMap[courseCode] || defaultOccurrence || "";
+    if (!isRespectiveOccurrence("", studentOcc, title, rawSummary)) {
+      continue;
+    }
+
+    // 1. Inspect ev.DESCRIPTION first using regex for direct course module activity link
+    const descUrlMatch = (ev.DESCRIPTION || "").match(/https?:\/\/[^\s"'>]*\/mod\/[a-z]+\/view\.php\?id=\d+/i);
+    const isDirectActivityUrl = (url) => /https?:\/\/[^\s"'>]*\/mod\/[a-z]+\/view\.php\?id=\d+/i.test(url || "");
+
+    let finalUrl = "";
+    let cmid = "";
+    let modType = "assign";
+
+    if (descUrlMatch) {
+      finalUrl = descUrlMatch[0];
+      const m = finalUrl.match(/id=(\d+)/);
+      if (m) cmid = m[1];
+      const modMatch = finalUrl.match(/\/mod\/([a-z]+)\//i);
+      if (modMatch) modType = modMatch[1].toLowerCase();
+    } else if (isDirectActivityUrl(rawUrl)) {
+      // 2. If ev.URL is already a valid activity link (/mod/assign/view.php?id=... or /mod/quiz/...), use it
+      finalUrl = rawUrl;
+      const m = finalUrl.match(/id=(\d+)/);
+      if (m) cmid = m[1];
+      const modMatch = finalUrl.match(/\/mod\/([a-z]+)\//i);
+      if (modMatch) modType = modMatch[1].toLowerCase();
+    } else {
+      // 3. Never construct a synthetic mod/assign/view.php URL using the calendar event ID.
+      // Instead, fallback cleanly to the legitimate Moodle Calendar Event link:
+      const eventId = uid.match(/(\d+)@/)?.[1] || "";
+      finalUrl = eventId
+        ? `https://spectrum.um.edu.my/calendar/view.php?view=event&id=${eventId}`
+        : (rawUrl || "https://spectrum.um.edu.my/calendar/view.php");
+      cmid = "";
+    }
+
+    const eventId = uid.match(/(\d+)@/)?.[1] || "";
+    const itemId = cmid || eventId || uid || title;
+
+    const formattedTime = new Date(dueTimestamp).toLocaleString("en-MY", {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+
+    deadlines.push({
+      id: String(itemId),
+      cmid: cmid ? String(cmid) : "",
+      title,
+      courseCode,
+      courseName: courseCode,
+      dueDate: new Date(dueTimestamp).toISOString(),
+      dueTimestamp,
+      formattedTime,
+      url: finalUrl,
+      type: modType,
+      submissionStatus: "No submission recorded",
+      isSubmittedOnSpectrum: false,
+      isCompleted: false,
+      urgency: calculateUrgency(dueTimestamp),
+      matchesOccurrence: true,
+      source: "ical"
+    });
+  }
+
+  return deadlines;
+}
+
+/**
+ * Parse Moodle AJAX `core_course_get_contents` JSON structure.
+ * Extracts assignment dropboxes and attendance module instances across all course sections
+ * with zero HTML parsing overhead.
+ */
+export function parseCourseContentsModules(sectionsJson, courseCode = "", courseName = "", studentOccurrence = "") {
+  if (!Array.isArray(sectionsJson)) {
+    return { assignments: [], attendanceModules: [] };
+  }
+
+  const assignments = [];
+  const attendanceModules = [];
+
+  for (const section of sectionsJson) {
+    const sectionName = section.name || "";
+    const modules = Array.isArray(section.modules) ? section.modules : [];
+
+    for (const mod of modules) {
+      if (!mod || !mod.modname) continue;
+      if (mod.uservisible === false) continue;
+
+      const modType = String(mod.modname).toLowerCase();
+      const cmid = String(mod.id);
+      const rawTitle = mod.name || "";
+      const title = cleanMoodleTitle(rawTitle);
+      const url = mod.url || `https://spectrum.um.edu.my/mod/${modType}/view.php?id=${cmid}`;
+
+      // 1. Attendance Modules
+      if (modType === "attendance" || isAttendanceActivity({ title, url, type: modType })) {
+        attendanceModules.push({
+          id: cmid,
+          cmid,
+          name: rawTitle,
+          title,
+          url,
+          sectionName
+        });
+        continue;
+      }
+
+      // 2. Submission Dropboxes & Activities (assign, quiz, turnitintooltwo, workshop)
+      if (
+        modType === "assign" ||
+        modType === "quiz" ||
+        modType.includes("turnitin") ||
+        modType === "workshop" ||
+        modType === "feedback"
+      ) {
+        // Occurrence filter
+        if (!isRespectiveOccurrence("", studentOccurrence, title, sectionName)) {
+          continue;
+        }
+
+        // Extract due date from Moodle module dates array or custom properties
+        let dueTimestamp = null;
+        if (Array.isArray(mod.dates)) {
+          for (const d of mod.dates) {
+            const label = (d.label || d.dataid || "").toLowerCase();
+            if (label.includes("due") || label.includes("tutup") || label.includes("close") || label.includes("akhir") || d.dataid === "duedate") {
+              if (d.timestamp) {
+                dueTimestamp = d.timestamp * 1000;
+                break;
+              }
+            }
+          }
+          if (!dueTimestamp && mod.dates.length > 0) {
+            const cand = mod.dates.find(d => d.timestamp && !isNaN(Number(d.timestamp)));
+            if (cand) dueTimestamp = Number(cand.timestamp) * 1000;
+          }
+        }
+
+        // Check customdata or description if dates array was omitted by Moodle AJAX
+        if (!dueTimestamp && mod.customdata) {
+          try {
+            const cd = typeof mod.customdata === "string" ? JSON.parse(mod.customdata) : mod.customdata;
+            if (cd?.duedate) dueTimestamp = Number(cd.duedate) * 1000;
+            else if (cd?.timeclose) dueTimestamp = Number(cd.timeclose) * 1000;
+            else if (cd?.cutoffdate) dueTimestamp = Number(cd.cutoffdate) * 1000;
+          } catch (_) { }
+        }
+        if (!dueTimestamp && mod.description) {
+          const m = String(mod.description).match(/(?:due\s*date|closed?\s*date|close\s*date|quiz\s*closes?|closes?|closed(?:\s+on)?|cut-?off\s*date|cutoff\s*date|tarikh\s*(?:akhir|tutup)|ditutup\s*(?:pada)?|tutup)[\s:]*[\r\n\s]*([0-9A-Za-z\s,.:\-]+(?:am|pm|[\d]{2,4}))/i);
+          if (m) {
+            const parsedTs = parseMoodleDateString(m[1].trim());
+            if (parsedTs) dueTimestamp = parsedTs;
+          }
+        }
+
+        // Completion status
+        let isSubmitted = false;
+        if (mod.completiondata) {
+          const state = mod.completiondata.state;
+          // In Moodle: 1 = complete, 2 = complete pass
+          if (state === 1 || state === 2) {
+            isSubmitted = true;
+          }
+        }
+
+        if (isOverdueMoreThan40Days(dueTimestamp)) {
+          continue;
+        }
+
+        const formattedTime = dueTimestamp
+          ? new Date(dueTimestamp).toLocaleString("en-MY", {
+            month: "short",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit"
+          })
+          : "No due date";
+
+        const dateLabel = modType === "quiz" ? "Closes" : "Due";
+
+        assignments.push({
+          id: cmid,
+          cmid,
+          title,
+          courseCode: courseCode || "Course",
+          courseName: courseName || courseCode,
+          dueDate: dueTimestamp ? new Date(dueTimestamp).toISOString() : "",
+          dueTimestamp,
+          formattedTime,
+          dateLabel,
+          url,
+          type: modType,
+          submissionStatus: isSubmitted ? "Submitted" : "No submission",
+          isSubmittedOnSpectrum: isSubmitted,
+          isCompleted: isSubmitted,
+          urgency: dueTimestamp ? calculateUrgency(dueTimestamp) : "upcoming",
+          matchesOccurrence: true,
+          sectionName
+        });
+      }
+    }
+  }
+
+  return { assignments, attendanceModules };
+}
+
+/**
+ * Parse SPeCTRUM Moodle Gradebook User Report (/grade/report/user/index.php?id=...)
+ * Extracts overall attendance percentage, points earned, and total sessions.
+ */
+export function parseGradebookAttendance(html) {
+  if (!html) return null;
+
+  // 1. DOMParser approach (Browser)
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const rows = doc.querySelectorAll("table.user-grade tr, table.generaltable tr");
+      for (const tr of rows) {
+        const itemCell = tr.querySelector("th.item, td.item, td:first-child");
+        const itemText = (itemCell?.textContent || "").toLowerCase();
+        if (itemText.includes("attendance") || itemText.includes("kehadiran")) {
+          const cells = Array.from(tr.querySelectorAll("td"));
+          let gradeVal = "";
+          let rangeVal = "";
+          let percentageVal = "";
+
+          for (const td of cells) {
+            const text = td.textContent.trim();
+            if (/\d+[\.\,]?\d*\s*%/i.test(text)) {
+              percentageVal = text;
+            } else if (/^\d+[\.\,]?\d*(?:\s*\/\s*\d+[\.\,]?\d*)?$/.test(text) && !gradeVal) {
+              gradeVal = text;
+            } else if (/^\d+\s*[-–]\s*\d+$/.test(text) && !rangeVal) {
+              rangeVal = text;
+            }
+          }
+
+          return {
+            hasAttendance: true,
+            percentage: percentageVal || "N/A",
+            points: gradeVal ? (rangeVal ? `${gradeVal} / ${rangeVal}` : gradeVal) : "N/A"
+          };
+        }
+      }
+    } catch (_) { }
+  }
+
+  // 2. Regex fallback
+  const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let rM;
+  while ((rM = rowRegex.exec(html)) !== null) {
+    const rHtml = rM[1];
+    if (/attendance|kehadiran/i.test(rHtml)) {
+      const allPct = Array.from(rHtml.matchAll(/(\d+(?:\.\d+)?\s*%)/g));
+      const pctMatch = allPct.length > 0 ? allPct[allPct.length - 1][1] : null;
+      const gradeMatch = rHtml.match(/<td[^>]*class=["'][^"']*grade[^"']*["'][^>]*>([\s\S]*?)<\/td>/i) ||
+        rHtml.match(/<td[^>]*>([\d\.\/ ]+)<\/td>/i);
+      return {
+        hasAttendance: true,
+        percentage: pctMatch ? pctMatch.trim() : "N/A",
+        points: gradeMatch ? gradeMatch[1].replace(/<[^>]+>/g, "").trim() : "N/A"
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Concurrency-limited Promise mapper.
+ * Executes async tasks over items with at most `concurrency` tasks in-flight simultaneously.
+ */
+export async function pMap(items, fn, concurrency = 2) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const results = [];
+  const executing = new Set();
+  for (const item of items) {
+    const p = Promise.resolve().then(() => fn(item));
+    results.push(p);
+    executing.add(p);
+    const clean = () => executing.delete(p);
+    p.then(clean, clean);
+    if (executing.size >= concurrency) {
+      await Promise.race(executing);
+    }
+  }
+  return Promise.allSettled(results);
+}

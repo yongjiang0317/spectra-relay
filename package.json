@@ -1,0 +1,16 @@
+{
+  "name": "spectra-relay",
+  "version": "1.0.2",
+  "description": "Smart Chrome Extension & 24/7 Cloud Relay for Universiti Malaya SPeCTRUM (Moodle)",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node cloud/run-tests.js",
+    "deploy": "wrangler deploy",
+    "dev:local": "python3 cloud/local-dev-server.py"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

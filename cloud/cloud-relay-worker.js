@@ -1,0 +1,1167 @@
+/**
+ * Spectra - Universiti Malaya SPeCTRUM Companion
+ * Cloud Relay Worker (Cloudflare Workers / V8 Serverless)
+ *
+ * Provides 24/7 background polling for SPeCTRUM course announcements
+ * and urgent deadline alerts even when the student's laptop is powered down.
+ *
+ * Requirements:
+ * - Cloudflare Worker with KV namespace binding: SPECTRA_KV
+ * - Environment variables / Secrets:
+ *   - TELEGRAM_BOT_TOKEN
+ *   - TELEGRAM_CHAT_ID
+ *   - RELAY_SECRET_KEY
+ * - Cron Trigger: `* * * * *` (Runs every minute)
+ */
+
+export default {
+  // HTTP Endpoint Handler
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, "") || "/";
+
+    // CORS Headers for Chrome Extension
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization"
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    // Verify Bearer Secret Token
+    const authHeader = request.headers.get("Authorization") || "";
+    const expectedSecret = env.RELAY_SECRET_KEY;
+    if (!expectedSecret) {
+      return new Response(JSON.stringify({ error: "Worker relay secret is not configured" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+    }
+    if (authHeader !== `Bearer ${expectedSecret}`) {
+      return new Response(JSON.stringify({ error: "Unauthorized: Invalid or missing Bearer token" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+    }
+
+    // Route: POST /sync-cookie or POST /sync (called by Spectra Extension on cookie change)
+    if ((path === "/sync-cookie" || path === "/sync" || path === "/") && request.method === "POST") {
+      try {
+        const body = await request.json().catch(() => ({}));
+        const rawToken = body.sessionToken || body.cookie || body.moodleSession || "";
+        const sessionToken = typeof rawToken === "string" ? rawToken.replace(/^MoodleSession=/i, "").split(";")[0].trim() : "";
+        const {
+          expires,
+          domain,
+          courses,
+          occurrences,
+          passwords,
+          sesskey,
+          telegramToken,
+          telegramChatId,
+          calendarIcalUrl
+        } = body;
+
+        if (!sessionToken) {
+          return new Response(JSON.stringify({ error: "Missing sessionToken" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json", ...corsHeaders }
+          });
+        }
+
+        // Store session and course configurations in Cloudflare KV
+        const sessionRecord = {
+          sessionToken,
+          domain: domain || "spectrum.um.edu.my",
+          expires: expires || null,
+          courses: courses || [],
+          occurrences: occurrences || {},
+          passwords: passwords || {},
+          sesskey: sesskey || "",
+          calendarIcalUrl: calendarIcalUrl || body.calendar_ical_url || body.calendarUrl || "",
+          telegramToken: telegramToken || body.telegram_bot_token || "",
+          telegramChatId: telegramChatId || body.telegram_chat_id || "",
+          updatedAt: Date.now()
+        };
+
+        if (env.SPECTRA_KV) {
+          await env.SPECTRA_KV.put("moodle_session", JSON.stringify(sessionRecord));
+        } else {
+          console.warn("[Spectra Relay] SPECTRA_KV binding is missing. Session not persisted.");
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          message: "MoodleSession, occurrences, and Telegram settings synchronized to Cloud Relay KV.",
+          timestamp: Date.now()
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", ...corsHeaders }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json", ...corsHeaders }
+        });
+      }
+    }
+
+    // Route: GET /status
+    if ((path === "/status" || path === "/") && request.method === "GET") {
+      let record = null;
+      if (env.SPECTRA_KV) {
+        const raw = await env.SPECTRA_KV.get("moodle_session");
+        if (raw) record = JSON.parse(raw);
+      }
+
+      return new Response(JSON.stringify({
+        status: "online",
+        hasSession: Boolean(record?.sessionToken),
+        coursesCount: record?.courses?.length || 0,
+        updatedAt: record?.updatedAt ? new Date(record.updatedAt).toISOString() : null,
+        cronSchedule: "Every 1 minute"
+      }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+    }
+
+    // Route: POST /poll (Manual Polling Trigger)
+    if (path === "/poll" && request.method === "POST") {
+      const result = await runSpectrumPollingJob(env);
+      return new Response(JSON.stringify(result), {
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+    }
+
+    return new Response(JSON.stringify({ error: "Endpoint not found", requestedPath: path }), {
+      status: 404,
+      headers: { "Content-Type": "application/json", ...corsHeaders }
+    });
+  },
+
+  // Cron Trigger Handler
+  async scheduled(event, env, ctx) {
+    console.log("[Spectra Relay] Cron triggered at:", event.cron);
+    ctx.waitUntil(runSpectrumPollingJob(env));
+  }
+};
+
+/**
+ * 24/7 Polling Routine
+ */
+async function runSpectrumPollingJob(env) {
+  let sessionData = null;
+  if (env.SPECTRA_KV) {
+    const raw = await env.SPECTRA_KV.get("moodle_session");
+    if (raw) sessionData = JSON.parse(raw);
+  }
+
+  if (!sessionData?.sessionToken) {
+    console.log("[Spectra Relay] No active MoodleSession found in KV. Waiting for extension sync.");
+    return { status: "skipped", reason: "no_session" };
+  }
+
+  const cookieHeader = `MoodleSession=${sessionData.sessionToken}`;
+  const botToken = env.TELEGRAM_BOT_TOKEN || sessionData.telegramToken;
+  const chatId = env.TELEGRAM_CHAT_ID || sessionData.telegramChatId;
+
+  try {
+    // 1. Fetch SPeCTRUM calendar upcoming to verify session and check upcoming tasks
+    const calRes = await fetch("https://spectrum.um.edu.my/calendar/view.php?view=upcoming", {
+      headers: {
+        "Cookie": cookieHeader,
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Spectra-Relay/1.0"
+      }
+    });
+
+    if (calRes.status === 303 || calRes.url.includes("/login/")) {
+      console.warn("[Spectra Relay] Session expired or invalid.");
+      let icsDeadlinesResult = { checked: 0, alerted: 0 };
+      if (sessionData.calendarIcalUrl) {
+        console.log("[Spectra Relay] Session cookie expired, but permanent iCal feed is configured. Scanning deadlines via iCal...");
+        icsDeadlinesResult = await checkCloudDeadlinesViaIcs(env, sessionData);
+      }
+
+      if (botToken && chatId) {
+        const extraNote = sessionData.calendarIcalUrl
+          ? "\n\n<i>Note: 24/7 deadline tracking remains active via your permanent iCal feed.</i>"
+          : "";
+        await dispatchTelegram(
+          botToken,
+          chatId,
+          `⚠️ <b>Spectra Relay Warning</b>\nYour UM SPeCTRUM session has expired. Please open SPeCTRUM in your browser to renew your login.${extraNote}`
+        );
+      }
+      return {
+        status: "expired",
+        deadlinesChecked: icsDeadlinesResult.checked,
+        deadlinesAlerted: icsDeadlinesResult.alerted
+      };
+    }
+
+    console.log("[Spectra Relay] Successfully authenticated to SPeCTRUM via Cloud Relay.");
+
+    // Auto-discover enrolled courses if not yet populated in sessionData
+    if (!sessionData.courses || sessionData.courses.length === 0) {
+      try {
+        const myRes = await fetch("https://spectrum.um.edu.my/my/", {
+          headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+        });
+        if (myRes.ok) {
+          const myHtml = await myRes.text();
+          const discoveredCourses = [];
+          const seenIds = new Set();
+          const cRegex = /href=["'][^"']*\/course\/view\.php\?id=(\d+)[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi;
+          let cm;
+          while ((cm = cRegex.exec(myHtml)) !== null) {
+            const cid = cm[1];
+            if (cid === "1" || seenIds.has(cid)) continue;
+            seenIds.add(cid);
+            const rawText = cm[2].replace(/<[^>]+>/g, "").trim();
+            const codeM = rawText.match(/\b([A-Z]{3,4}\d{4})\b/i);
+            const code = codeM ? codeM[1].toUpperCase() : `C${cid}`;
+            discoveredCourses.push({ id: cid, code, name: rawText });
+          }
+          if (discoveredCourses.length > 0) {
+            sessionData.courses = discoveredCourses;
+            if (env.SPECTRA_KV) {
+              env.SPECTRA_KV.put("moodle_session", JSON.stringify(sessionData)).catch(() => {});
+            }
+          }
+        }
+      } catch (_) { }
+    }
+
+    // 2. 24/7 Cloud Attendance Scanner & Auto-Submission
+    const attendanceResult = await checkAndRecordCloudAttendance(env, sessionData);
+
+    // 3. 24/7 Cloud Submission Deadline Scanner & Urgent Alert Dispatch
+    const deadlineResult = await checkCloudDeadlines(env, sessionData);
+
+    // 4. 24/7 Cloud Course Announcement Scanner & Telegram Dispatch
+    const announcementResult = await checkCloudAnnouncements(env, sessionData);
+
+    return {
+      status: "ok",
+      timestamp: Date.now(),
+      attendanceChecked: attendanceResult.checked,
+      attendanceRecorded: attendanceResult.recorded,
+      deadlinesChecked: deadlineResult.checked,
+      deadlinesAlerted: deadlineResult.alerted,
+      announcementsChecked: announcementResult.checked,
+      announcementsSent: announcementResult.sent
+    };
+  } catch (err) {
+    console.error("[Spectra Relay] Polling job failed:", err);
+    return { status: "error", message: err.message };
+  }
+}
+
+/**
+ * 24/7 Cloud Attendance Scanner & Self-Checkin Routine
+ */
+async function checkAndRecordCloudAttendance(env, sessionData) {
+  const { sessionToken, courses = [], occurrences = {}, passwords = {} } = sessionData;
+  if (!courses || courses.length === 0) {
+    return { checked: 0, recorded: 0 };
+  }
+
+  const cookieHeader = `MoodleSession=${sessionToken}`;
+  const botToken = env.TELEGRAM_BOT_TOKEN || sessionData.telegramToken;
+  const chatId = env.TELEGRAM_CHAT_ID || sessionData.telegramChatId;
+
+  let recordedSessids = new Set();
+  if (env.SPECTRA_KV) {
+    const rawRecorded = await env.SPECTRA_KV.get("recorded_sessids");
+    if (rawRecorded) {
+      try {
+        recordedSessids = new Set(JSON.parse(rawRecorded));
+      } catch (_) { }
+    }
+  }
+
+  let recordedCount = 0;
+  let checkedCourses = 0;
+
+  for (const course of courses) {
+    const courseId = typeof course === "object" ? (course.id || course.courseId) : course;
+    const courseCode = typeof course === "object" ? (course.code || courseId) : course;
+    if (!courseId) continue;
+
+    const studentOcc = occurrences[courseId] || occurrences[courseCode] || "";
+    const storedPwd = passwords[courseId] || passwords[courseCode] || "";
+
+    try {
+      let viewMatches = [];
+      const indexRes = await fetch(`https://spectrum.um.edu.my/mod/attendance/index.php?id=${encodeURIComponent(courseId)}`, {
+        headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+      });
+      if (indexRes.ok) {
+        const indexHtml = await indexRes.text();
+        viewMatches = indexHtml.match(/href=["']([^"']*\/mod\/attendance\/view\.php\?[^"']*)["']/gi) || [];
+      }
+
+      // Fallback: If index didn't yield attendance views, inspect course view page directly
+      if (viewMatches.length === 0) {
+        const courseRes = await fetch(`https://spectrum.um.edu.my/course/view.php?id=${encodeURIComponent(courseId)}`, {
+          headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+        });
+        if (courseRes.ok) {
+          const courseHtml = await courseRes.text();
+          viewMatches = courseHtml.match(/href=["']([^"']*\/mod\/attendance\/view\.php\?[^"']*)["']/gi) || [];
+        }
+      }
+
+      if (viewMatches.length === 0) continue;
+
+      checkedCourses++;
+
+      for (const rawMatch of viewMatches) {
+        const urlMatch = rawMatch.match(/href=["']([^"']+)["']/i);
+        if (!urlMatch) continue;
+        let viewUrl = urlMatch[1];
+        if (!viewUrl.startsWith("http")) {
+          viewUrl = `https://spectrum.um.edu.my/${viewUrl.replace(/^\//, "")}`;
+        }
+
+        const allViewUrl = viewUrl.includes("view=") ? viewUrl.replace(/view=\d+/, "view=5") : `${viewUrl}&view=5`;
+
+        const viewRes = await fetch(allViewUrl, {
+          headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+        });
+        if (!viewRes.ok) continue;
+        const viewHtml = await viewRes.text();
+
+        const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+        let rowM;
+        while ((rowM = rowRegex.exec(viewHtml)) !== null) {
+          const rowHtml = rowM[1];
+          const submitM = rowHtml.match(/href=["']([^"']*attendance\.php\?sessid=(\d+)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/i);
+          if (!submitM) continue;
+
+          const submitUrl = submitM[1];
+          const sessid = submitM[2];
+
+          if (recordedSessids.has(sessid)) continue;
+
+          const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+          const cells = [];
+          let cM;
+          while ((cM = cellRegex.exec(rowHtml)) !== null) {
+            cells.push(cM[1].replace(/<[^>]+>/g, "").trim());
+          }
+
+          const dateText = cells[0] || "Today";
+          const timeText = cells[1] || "";
+          const groupText = cells.length >= 6 ? cells[2] : "All students";
+          const descText = cells.length >= 6 ? cells[3] : cells[2] || "Class Session";
+
+          if (studentOcc && !matchesOccurrence(groupText, studentOcc, descText)) {
+            continue;
+          }
+
+          const formTargetUrl = submitUrl.startsWith("http")
+            ? submitUrl
+            : `https://spectrum.um.edu.my/${submitUrl.replace(/^\//, "")}`;
+
+          const formRes = await fetch(formTargetUrl, {
+            headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+          });
+          if (!formRes.ok) continue;
+          const formHtml = await formRes.text();
+
+          const sesskeyM = formHtml.match(/name=["']sesskey["'][^>]*value=["']([^"']+)["']/i) ||
+            formHtml.match(/value=["']([^"']+)["'][^>]*name=["']sesskey["']/i) ||
+            formHtml.match(/"sesskey":"([^"]+)"/);
+          const formSesskey = sesskeyM ? sesskeyM[1] : (sessionData.sesskey || "");
+
+          const formSessidM = formHtml.match(/name=["']sessid["'][^>]*value=["']([^"']+)["']/i) ||
+            formHtml.match(/value=["']([^"']+)["'][^>]*name=["']sessid["']/i);
+          const formSessid = formSessidM ? formSessidM[1] : sessid;
+
+          let statusId = null;
+          const inputStatusRegex = /<input[^>]*name=["']status["'][^>]*>/gi;
+          let inMatch;
+          while ((inMatch = inputStatusRegex.exec(formHtml)) !== null) {
+            const tagStr = inMatch[0];
+            const valM = tagStr.match(/value=["'](\d+)["']/i);
+            const idM = tagStr.match(/id=["']([^"']+)["']/i);
+            if (!valM) continue;
+            const val = valM[1];
+
+            let isPresent = false;
+            if (idM) {
+              const labelForRegex = new RegExp(`<label[^>]*for=["']${idM[1]}["'][^>]*>([\\s\\S]*?)<\\/label>`, "i");
+              const lMatch = formHtml.match(labelForRegex);
+              if (lMatch && /present|hadir|^p\b/i.test(lMatch[1].replace(/<[^>]+>/g, "").trim())) {
+                isPresent = true;
+              }
+            }
+            if (!isPresent) {
+              const afterInput = formHtml.substring(inputStatusRegex.lastIndex, inputStatusRegex.lastIndex + 300);
+              const nextLabelM = afterInput.match(/^[\s\S]*?<label[^>]*>([\s\S]*?)<\/label>/i);
+              if (nextLabelM && /present|hadir|^p\b/i.test(nextLabelM[1].replace(/<[^>]+>/g, "").trim())) {
+                isPresent = true;
+              }
+            }
+            if (!isPresent) {
+              const surrounding = formHtml.substring(Math.max(0, inMatch.index - 50), Math.min(formHtml.length, inMatch.index + 200));
+              if (/present|hadir/i.test(surrounding)) {
+                isPresent = true;
+              }
+            }
+            if (isPresent) {
+              statusId = val;
+              break;
+            }
+          }
+
+          if (!statusId) {
+            const anyRadio = formHtml.match(/name=["']status["'][^>]*value=["'](\d+)["']/i) ||
+              formHtml.match(/value=["'](\d+)["'][^>]*name=["']status["']/i) ||
+              formHtml.match(/<input[^>]+type=["']radio["'][^>]*value=["'](\d+)["']/i) ||
+              formHtml.match(/value=["'](\d+)["'][^>]*type=["']radio["']/i);
+            if (anyRadio) statusId = anyRadio[1];
+          }
+
+          if (!statusId) continue;
+
+          const requiresPassword = /<input[^>]+name=["'](studentpassword|password)["']/i.test(formHtml);
+          if (requiresPassword && !storedPwd) {
+            if (botToken && chatId) {
+              await dispatchTelegram(
+                botToken,
+                chatId,
+                `⚠️ <b>Spectra Cloud Relay: Attendance Password Required</b>\n` +
+                `<b>Course:</b> ${courseCode}\n` +
+                `<b>Session:</b> ${descText} (${dateText} ${timeText})\n` +
+                `Please enter the attendance password in Spectra settings.`
+              );
+            }
+            continue;
+          }
+
+          let bodyStr = "";
+          if (typeof URLSearchParams !== "undefined") {
+            const postParams = new URLSearchParams();
+            postParams.append("sessid", formSessid);
+            postParams.append("sesskey", formSesskey);
+            postParams.append("mform_is_submitted", "1");
+            postParams.append("status", statusId);
+            postParams.append("submitbutton", "Save changes");
+            if (storedPwd) {
+              postParams.append("studentpassword", storedPwd);
+              postParams.append("password", storedPwd);
+            }
+            bodyStr = postParams.toString();
+          } else {
+            const parts = [
+              `sessid=${encodeURIComponent(formSessid)}`,
+              `sesskey=${encodeURIComponent(formSesskey)}`,
+              "mform_is_submitted=1",
+              `status=${encodeURIComponent(statusId)}`,
+              `submitbutton=${encodeURIComponent("Save changes")}`
+            ];
+            if (storedPwd) {
+              parts.push(`studentpassword=${encodeURIComponent(storedPwd)}`);
+              parts.push(`password=${encodeURIComponent(storedPwd)}`);
+            }
+            bodyStr = parts.join("&");
+          }
+
+          const postRes = await fetch("https://spectrum.um.edu.my/mod/attendance/attendance.php", {
+            method: "POST",
+            headers: {
+              "Cookie": cookieHeader,
+              "Content-Type": "application/x-www-form-urlencoded",
+              "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0"
+            },
+            body: bodyStr
+          });
+
+          const postText = await postRes.text();
+          const redirectedToView = postRes.redirected && /\/mod\/attendance\/view\.php(?:\?|$)/i.test(postRes.url || "");
+          const confirmationText = /(?:your attendance has been (?:successfully )?recorded|attendance (?:has been|was) successfully recorded|kehadiran anda telah direkodkan|attendance recorded successfully)/i.test(postText);
+          if (postRes.ok && (redirectedToView || confirmationText)) {
+            recordedSessids.add(sessid);
+            recordedCount++;
+
+            if (botToken && chatId) {
+              await dispatchTelegram(
+                botToken,
+                chatId,
+                `✅ <b>Spectra Cloud Relay: Auto-Attendance Recorded!</b>\n` +
+                `<b>Course:</b> ${courseCode}\n` +
+                `<b>Occurrence:</b> ${studentOcc || "General"}\n` +
+                `<b>Session:</b> ${descText} (${dateText} ${timeText})\n` +
+                `<b>Status:</b> Present\n` +
+                `<i>Submitted automatically 24/7 via Cloudflare Relay!</i>`
+              );
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[Spectra Relay] Error checking attendance for ${courseCode}:`, err);
+    }
+  }
+
+  if (env.SPECTRA_KV && recordedCount > 0) {
+    await env.SPECTRA_KV.put("recorded_sessids", JSON.stringify(Array.from(recordedSessids)));
+  }
+
+  return { checked: checkedCourses, recorded: recordedCount };
+}
+
+function extractAllOccurrenceNumbersWorker(text) {
+  if (!text) return [];
+  const str = String(text).toLowerCase();
+  const numbers = new Set();
+
+  const rangeWordRegex = /\b(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?|lecture\s+group|lec\s+group|kumpulan\s+kuliah)\s*#?\s*0*(\d+)\s*(?:to|hingga|sampai)\s*(?:(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?|lecture\s+group|lec\s+group|kumpulan\s+kuliah)\s*#?\s*)?0*(\d+)\b/gi;
+  let rangeMatch;
+  while ((rangeMatch = rangeWordRegex.exec(str)) !== null) {
+    const start = parseInt(rangeMatch[1], 10);
+    const end = parseInt(rangeMatch[2], 10);
+    if (!isNaN(start) && !isNaN(end) && end >= start && end - start <= 20) {
+      for (let n = start; n <= end; n++) numbers.add(n);
+    }
+  }
+
+  const hyphenRangeRegex = /\b(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?)\s*#?\s*0*(\d+)\s*-\s*0*(\d+)\b(?!\s*-\s*(?:occ|group|kump|\d))/gi;
+  while ((rangeMatch = hyphenRangeRegex.exec(str)) !== null) {
+    const start = parseInt(rangeMatch[1], 10);
+    const end = parseInt(rangeMatch[2], 10);
+    if (!isNaN(start) && !isNaN(end) && end >= start && end - start <= 20) {
+      for (let n = start; n <= end; n++) numbers.add(n);
+    }
+  }
+
+  const tokenRegex = /(?:\b(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?|lecture\s+group|lec\s+group|kumpulan\s+kuliah)\s*#?\s*|\b[ktg]\s*#?\s*)0*(\d+)\b/gi;
+  let tokenMatch;
+  while ((tokenMatch = tokenRegex.exec(str)) !== null) {
+    const n = parseInt(tokenMatch[1], 10);
+    if (!isNaN(n)) numbers.add(n);
+  }
+
+  const listAfterPrefixRegex = /\b(?:occ(?:urrence)?|kumpulan|kump|group|tut(?:orial)?|lecture\s+group|lec\s+group|kumpulan\s+kuliah)\s*#?\s*0*(\d+)(?:\s*[,/&-]\s*0*(\d+))+/gi;
+  let listMatch;
+  while ((listMatch = listAfterPrefixRegex.exec(str)) !== null) {
+    const subDigits = listMatch[0].match(/\b0*(\d+)\b/g);
+    if (subDigits) {
+      subDigits.forEach((d) => {
+        const n = parseInt(d, 10);
+        if (!isNaN(n)) numbers.add(n);
+      });
+    }
+  }
+
+  const pureNumMatch = str.trim().match(/^0*(\d+)$/);
+  if (pureNumMatch) {
+    const n = parseInt(pureNumMatch[1], 10);
+    if (!isNaN(n)) numbers.add(n);
+  }
+
+  return Array.from(numbers);
+}
+
+function matchesOccurrence(groupStr, studentOcc, descStr = "") {
+  const targetOcc = String(studentOcc || "").trim().toLowerCase();
+  if (!targetOcc || targetOcc === "all") return true;
+  const g = String(groupStr || "").trim().toLowerCase();
+  let d = String(descStr || "").trim().toLowerCase();
+
+  // Strip task titles so "Tutorial 3 Submission" isn't treated as occurrence 3
+  d = d.replace(/\b(?:tutorial|tut|lab|assignment|tugasan)\s+\d+\s+(?:submission|link|dropbox|box|handin|hantar|due)\b/gi, "");
+  const universalGroup = !g || g === "all" || g.includes("all students") || g.includes("semua pelajar");
+
+  const studentNumbers = extractAllOccurrenceNumbersWorker(targetOcc);
+  const targetNumbers = !universalGroup ? extractAllOccurrenceNumbersWorker(g) : extractAllOccurrenceNumbersWorker(d);
+
+  if (targetNumbers.length > 0) {
+    if (studentNumbers.length === 0) return false;
+    return studentNumbers.some((n) => targetNumbers.includes(n));
+  }
+
+  if (universalGroup) return true;
+  return Boolean(targetOcc && (g === targetOcc || g.includes(targetOcc)));
+}
+
+function isAttendanceWorkerActivity(title, url = "") {
+  const u = String(url || "").toLowerCase();
+  if (u.includes("/mod/attendance/") || u.includes("attendance.php")) return true;
+
+  const t = String(title || "").toLowerCase().trim();
+  if (!t) return false;
+
+  const isProjectAboutAttendance =
+    /\b(?:system|sistem|software|app|application|aplikasi|tracker|tracking|database|proposal|casestudy|case\s+study|architecture|framework|development)\b/i.test(t) &&
+    /\b(?:assignment|project|projek|tugasan|homework|essay|report|laporan)\b/i.test(t);
+  if (isProjectAboutAttendance) return false;
+
+  const patterns = [
+    /\b(?:attendance|attendence|attandance|kehadiran|kedatangan|presensi|absensi)\b/i,
+    /\b(?:check[\s-]?in|sign[\s-]?in|roll[\s-]?call)\b/i,
+    /\b(?:take|record|submit|mark|verify|confirm|log)\s+(?:your\s+)?attendance\b/i,
+    /\b(?:rekod|isi|hantar|catat|daftar|sahkan|tanda|ambil)\s+kehadiran\b/i,
+    /\b(?:lecture|tutorial|lab|class|weekly|daily|sesi|session|kuliah|makmal|kelas|mingguan)\s+(?:attendance|kehadiran|check[\s-]?in|sign[\s-]?in)\b/i,
+    /\b(?:attendance|kehadiran)\s+(?:for\s+)?(?:lecture|tutorial|lab|class|week|minggu|sesi|session|kuliah|makmal|kelas)\b/i,
+    /\b(?:attendance|kehadiran)\s*[-–:]?\s*(?:occ|occurrence|group|kumpulan|tut|tutorial)\b/i,
+    /\b(?:qr|form|borang)\s+(?:code\s+)?(?:attendance|kehadiran)\b/i,
+    /\b(?:attendance|kehadiran)\s+(?:qr|form|borang)\b/i
+  ];
+
+  return patterns.some(p => p.test(t));
+}
+
+async function dispatchTelegram(botToken, chatId, textHtml) {
+  const cleanToken = (botToken || "").trim().replace(/^bot/i, "");
+  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: textHtml,
+      parse_mode: "HTML"
+    })
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok || !result?.ok) {
+    throw new Error(`Telegram delivery failed (HTTP ${response.status}): ${result?.description || "no confirmation"}`);
+  }
+  return true;
+}
+
+/**
+ * 24/7 Cloud Deadline Scanner & Telegram Urgent Alert Routine
+ */
+async function checkCloudDeadlines(env, sessionData) {
+  const { sessionToken, courses = [], occurrences = {} } = sessionData;
+  if (!courses || courses.length === 0) {
+    return { checked: 0, alerted: 0 };
+  }
+
+  const cookieHeader = `MoodleSession=${sessionToken}`;
+  const botToken = env.TELEGRAM_BOT_TOKEN || sessionData.telegramToken;
+  const chatId = env.TELEGRAM_CHAT_ID || sessionData.telegramChatId;
+  if (!botToken || !chatId) {
+    return { checked: 0, alerted: 0 };
+  }
+
+  let alertedDeadlineIds = new Set();
+  if (env.SPECTRA_KV) {
+    const rawAlerted = await env.SPECTRA_KV.get("alerted_deadline_ids");
+    if (rawAlerted) {
+      try {
+        alertedDeadlineIds = new Set(JSON.parse(rawAlerted));
+      } catch (_) { }
+    }
+  }
+
+  let alertedCount = 0;
+  let checkedCourses = 0;
+  const now = Date.now();
+
+  for (const course of courses) {
+    const courseId = typeof course === "object" ? (course.id || course.courseId) : course;
+    const courseCode = typeof course === "object" ? (course.code || courseId) : course;
+    if (!courseId) continue;
+
+    const studentOcc = occurrences[courseId] || occurrences[courseCode] || "";
+
+    try {
+      const foundAssignments = new Map();
+
+      // 1. Check mod/assign/index.php
+      try {
+        const res = await fetch(`https://spectrum.um.edu.my/mod/assign/index.php?id=${encodeURIComponent(courseId)}`, {
+          headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+        });
+        if (res.ok) {
+          const html = await res.text();
+          checkedCourses++;
+
+          const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+          let rowMatch;
+          while ((rowMatch = rowRegex.exec(html)) !== null) {
+            const rowHtml = rowMatch[1];
+            const linkMatch = rowHtml.match(/<a[^>]+href=["']([^"']*mod\/assign\/view\.php\?id=(\d+)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/i);
+            if (!linkMatch) continue;
+
+            const assignUrl = linkMatch[1];
+            const cmid = linkMatch[2];
+            const rawTitle = linkMatch[3].replace(/<[^>]+>/g, "").trim();
+
+            if (isAttendanceWorkerActivity(rawTitle, assignUrl)) continue;
+
+            const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+            const cells = [];
+            let cM;
+            while ((cM = cellRegex.exec(rowHtml)) !== null) {
+              cells.push(cM[1].replace(/<[^>]+>/g, "").trim());
+            }
+
+            let dueDateText = "";
+            let submissionStatusText = "";
+            for (const c of cells) {
+              if (c.includes(rawTitle)) continue;
+              if (!dueDateText && (/\d{1,2}[:.]\d{2}/.test(c) || /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|okt|mac|mei|ogo|dis)\b/i.test(c) || /\d{1,2}[\/\.\-]\d{1,2}/.test(c))) {
+                dueDateText = c;
+              } else if (!submissionStatusText && c && !/^(week|minggu|topic|topik|\d+)\$/i.test(c)) {
+                submissionStatusText = c;
+              }
+            }
+
+            const isSubmitted = /submitted|graded|selesai|dihantar/i.test(submissionStatusText) && !/no submission|not submitted|belum/i.test(submissionStatusText);
+
+            foundAssignments.set(cmid, {
+              cmid,
+              title: rawTitle,
+              url: assignUrl,
+              dueDateText,
+              isSubmitted
+            });
+          }
+        }
+      } catch (_) { }
+
+      // 2. Fallback: Parse course/view.php to catch assignments inside sub-sections or containers
+      try {
+        const courseRes = await fetch(`https://spectrum.um.edu.my/course/view.php?id=${encodeURIComponent(courseId)}`, {
+          headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+        });
+        if (courseRes.ok) {
+          const courseHtml = await courseRes.text();
+          const assignRegex = /<a[^>]+href=["']([^"']*\/mod\/assign\/view\.php\?id=(\d+)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
+          let aMatch;
+          while ((aMatch = assignRegex.exec(courseHtml)) !== null) {
+            const assignUrl = aMatch[1];
+            const cmid = aMatch[2];
+            const rawTitle = aMatch[3].replace(/<[^>]+>/g, "").trim();
+
+            if (!rawTitle || isAttendanceWorkerActivity(rawTitle, assignUrl)) continue;
+
+            if (!foundAssignments.has(cmid)) {
+              foundAssignments.set(cmid, {
+                cmid,
+                title: rawTitle,
+                url: assignUrl,
+                dueDateText: "",
+                isSubmitted: false
+              });
+            }
+          }
+        }
+      } catch (_) { }
+
+      // 3. Process assignments
+      for (const [cmid, assign] of foundAssignments.entries()) {
+        if (alertedDeadlineIds.has(cmid)) continue;
+        if (studentOcc && !matchesOccurrence("", studentOcc, assign.title)) continue;
+        if (assign.isSubmitted) continue;
+
+        let dueTimestamp = assign.dueDateText ? parseWorkerDateString(assign.dueDateText) : null;
+        let dueDateDisplay = assign.dueDateText;
+
+        if (!dueTimestamp) {
+          try {
+            const fullViewUrl = assign.url.startsWith("http") ? assign.url : `https://spectrum.um.edu.my/${assign.url.replace(/^\//, "")}`;
+            const viewRes = await fetch(fullViewUrl, {
+              headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+            });
+            if (viewRes.ok) {
+              const viewHtml = await viewRes.text();
+              if (/submitted for grading|telah dihantar/i.test(viewHtml)) continue;
+
+              const dueMatch = viewHtml.match(/<th[^>]*class=["'][^"']*cell[^"']*header[^"']*>\s*(?:Due date|Tarikh akhir)\s*<\/th>\s*<td[^>]*class=["'][^"']*cell[^"']*lastcol[^"']*>([\s\S]*?)<\/td>/i) ||
+                viewHtml.match(/(?:Due date|Tarikh akhir)[:\s]*<[^>]*>([\s\S]*?)<\/[^>]*>/i);
+              if (dueMatch) {
+                dueDateDisplay = dueMatch[1].replace(/<[^>]+>/g, "").trim();
+                dueTimestamp = parseWorkerDateString(dueDateDisplay);
+              }
+            }
+          } catch (_) { }
+        }
+
+        if (!dueTimestamp) continue;
+        if (now - dueTimestamp > 100 * 24 * 60 * 60 * 1000) continue;
+
+        const diffHours = (dueTimestamp - now) / (1000 * 60 * 60);
+        if (diffHours > 0 && diffHours <= 24) {
+          const hoursLeft = Math.max(1, Math.round(diffHours));
+          const fullUrl = assign.url.startsWith("http") ? assign.url : `https://spectrum.um.edu.my/${assign.url.replace(/^\//, "")}`;
+
+          await dispatchTelegram(
+            botToken,
+            chatId,
+            `⏰ <b>Spectra Urgent Submission Deadline!</b>\n` +
+            `<b>Course:</b> ${courseCode}\n` +
+            `<b>Task:</b> ${assign.title}\n` +
+            `<b>Due:</b> ${dueDateDisplay} (${hoursLeft}h remaining)\n` +
+            `<b>Status:</b> No submission recorded\n` +
+            `🔗 <a href="${fullUrl}">Open Submission Dropbox on SPeCTRUM</a>`
+          );
+
+          alertedDeadlineIds.add(cmid);
+          alertedCount++;
+        }
+      }
+    } catch (err) {
+      console.warn(`[Spectra Relay] Error checking deadlines for ${courseCode}:`, err);
+    }
+  }
+
+  // 4. Permanent iCal fallback
+  if (sessionData.calendarIcalUrl) {
+    try {
+      const icsRes = await checkCloudDeadlinesViaIcs(env, sessionData);
+      alertedCount += icsRes.alerted;
+      if (icsRes.checked > 0) checkedCourses += icsRes.checked;
+    } catch (_) { }
+  }
+
+  if (env.SPECTRA_KV && alertedCount > 0) {
+    await env.SPECTRA_KV.put("alerted_deadline_ids", JSON.stringify(Array.from(alertedDeadlineIds)));
+  }
+
+  return { checked: checkedCourses, alerted: alertedCount };
+}
+
+/**
+ * 24/7 Permanent iCal Deadline Scanner
+ */
+async function checkCloudDeadlinesViaIcs(env, sessionData) {
+  const { calendarIcalUrl, occurrences = {} } = sessionData;
+  if (!calendarIcalUrl) return { checked: 0, alerted: 0 };
+
+  const botToken = env.TELEGRAM_BOT_TOKEN || sessionData.telegramToken;
+  const chatId = env.TELEGRAM_CHAT_ID || sessionData.telegramChatId;
+  if (!botToken || !chatId) return { checked: 0, alerted: 0 };
+
+  let alertedDeadlineIds = new Set();
+  if (env.SPECTRA_KV) {
+    const rawAlerted = await env.SPECTRA_KV.get("alerted_deadline_ids");
+    if (rawAlerted) {
+      try {
+        alertedDeadlineIds = new Set(JSON.parse(rawAlerted));
+      } catch (_) { }
+    }
+  }
+
+  let alertedCount = 0;
+  try {
+    const res = await fetch(calendarIcalUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+    });
+    if (!res.ok) return { checked: 0, alerted: 0 };
+    const icsText = await res.text();
+    const unfolded = icsText.replace(/\r\n[ \t]|\r[ \t]|\n[ \t]/g, "");
+    const lines = unfolded.split(/\r\n|\r|\n/);
+
+    const events = [];
+    let cur = null;
+    for (const l of lines) {
+      const line = l.trim();
+      if (line === "BEGIN:VEVENT") cur = {};
+      else if (line === "END:VEVENT") { if (cur) events.push(cur); cur = null; }
+      else if (cur) {
+        const cIdx = line.indexOf(":");
+        if (cIdx !== -1) {
+          const k = line.substring(0, cIdx).split(";")[0].toUpperCase().trim();
+          cur[k] = line.substring(cIdx + 1);
+        }
+      }
+    }
+
+    const now = Date.now();
+    for (const ev of events) {
+      const summary = (ev.SUMMARY || "").replace(/\\,/g, ",").replace(/\\n/g, " ").trim();
+      const url = (ev.URL || "").trim();
+      const categories = (ev.CATEGORIES || "").trim();
+      const dateStr = ev.DTEND || ev.DTSTART || "";
+      const uid = (ev.UID || "").trim();
+      const cmidMatch = url.match(/id=(\d+)/) || uid.match(/(\d+)@/);
+      const cmid = cmidMatch ? cmidMatch[1] : uid;
+
+      if (!cmid || alertedDeadlineIds.has(cmid)) continue;
+      if (isAttendanceWorkerActivity(summary, url)) continue;
+
+      let courseCode = "";
+      const cMatch = categories.match(/\b([A-Z]{3,4}\s*\d{4})\b/i) || summary.match(/\b([A-Z]{3,4}\s*\d{4})\b/i);
+      if (cMatch) {
+        courseCode = cMatch[1].replace(/\s+/g, "");
+      } else {
+        courseCode = categories || "Course";
+      }
+
+      const studentOcc = occurrences[courseCode] || occurrences[courseCode.toLowerCase()] || "";
+      if (studentOcc && !matchesOccurrence("", studentOcc, summary)) continue;
+
+      let dueTimestamp = null;
+      const utcMatch = dateStr.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z\$/i);
+      if (utcMatch) {
+        const [, y, m, d, h, min, sec] = utcMatch;
+        dueTimestamp = Date.UTC(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(d, 10), parseInt(h, 10), parseInt(min, 10), parseInt(sec, 10));
+      } else {
+        const lMatch = dateStr.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/i);
+        if (lMatch) {
+          const [, y, m, d, h, min, sec] = lMatch;
+          dueTimestamp = new Date(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(d, 10), parseInt(h, 10), parseInt(min, 10), parseInt(sec, 10)).getTime();
+        }
+      }
+
+      if (!dueTimestamp) continue;
+      if (now - dueTimestamp > 100 * 24 * 60 * 60 * 1000) continue;
+
+      const diffHours = (dueTimestamp - now) / (1000 * 60 * 60);
+      if (diffHours > 0 && diffHours <= 24) {
+        const hoursLeft = Math.max(1, Math.round(diffHours));
+        const formattedDate = new Date(dueTimestamp).toLocaleString("en-MY", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+        await dispatchTelegram(
+          botToken,
+          chatId,
+          `⏰ <b>Spectra Urgent Submission Deadline!</b>\n` +
+          `<b>Course:</b> ${courseCode}\n` +
+          `<b>Task:</b> ${summary.replace(/\s+is due(?:\s+to submit)?$/i, "")}\n` +
+          `<b>Due:</b> ${formattedDate} (${hoursLeft}h remaining)\n` +
+          `🔗 <a href="${url || "https://spectrum.um.edu.my/calendar/view.php"}">Open on SPeCTRUM</a>`
+        );
+
+        alertedDeadlineIds.add(cmid);
+        alertedCount++;
+      }
+    }
+
+    if (env.SPECTRA_KV && alertedCount > 0) {
+      await env.SPECTRA_KV.put("alerted_deadline_ids", JSON.stringify(Array.from(alertedDeadlineIds)));
+    }
+  } catch (err) {
+    console.warn("[Spectra Relay] Error during iCal deadline check:", err);
+  }
+
+  return { checked: 1, alerted: alertedCount };
+}
+
+function parseWorkerDateString(dateStr) {
+  if (!dateStr) return null;
+  const raw = String(dateStr).trim();
+  const lower = raw.toLowerCase();
+  const now = new Date();
+
+  let hours = 23, minutes = 59;
+  const timeMatch = raw.match(/(\d{1,2})[:.](\d{2})\s*(am|pm)?/i);
+  if (timeMatch) {
+    let h = parseInt(timeMatch[1], 10);
+    const m = parseInt(timeMatch[2], 10);
+    const meridiem = (timeMatch[3] || "").toLowerCase();
+    if (meridiem === "pm" && h < 12) h += 12;
+    if (meridiem === "am" && h === 12) h = 0;
+    hours = h;
+    minutes = m;
+  }
+
+  if (lower.includes("today") || lower.includes("hari ini")) {
+    const d = new Date(now);
+    d.setHours(hours, minutes, 0, 0);
+    return d.getTime();
+  }
+  if (lower.includes("tomorrow") || lower.includes("esok")) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    d.setHours(hours, minutes, 0, 0);
+    return d.getTime();
+  }
+
+  let cleaned = raw
+    .replace(/\b(isnin|selasa|rabu|khamis|jumaat|sabtu|ahad)\b/gi, "")
+    .replace(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, "")
+    .replace(/\bjan(?:uari)?\b/gi, "Jan")
+    .replace(/\bfeb(?:ruari)?\b/gi, "Feb")
+    .replace(/\bmac\b/gi, "Mar")
+    .replace(/\bapr(?:il)?\b/gi, "Apr")
+    .replace(/\bmei\b/gi, "May")
+    .replace(/\bjun\b/gi, "Jun")
+    .replace(/\bjul(?:ai)?\b/gi, "Jul")
+    .replace(/\bogo(?:s)?\b/gi, "Aug")
+    .replace(/\bsep(?:tember)?\b/gi, "Sep")
+    .replace(/\bokt(?:ober)?\b/gi, "Oct")
+    .replace(/\bnov(?:ember)?\b/gi, "Nov")
+    .replace(/\bdis(?:ember)?\b/gi, "Dec")
+    .replace(/[,\(\)]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const slashMatch = cleaned.match(/^(\d{1,2})[\.\/\-](\d{1,2})(?:[\.\/\-](\d{2,4}))?/);
+  if (slashMatch) {
+    const day = parseInt(slashMatch[1], 10);
+    const month = parseInt(slashMatch[2], 10) - 1;
+    let year = slashMatch[3] ? parseInt(slashMatch[3], 10) : now.getFullYear();
+    if (year < 100) year += 2000;
+    return new Date(year, month, day, hours, minutes, 0, 0).getTime();
+  }
+
+  const monthMap = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+  const wordMatch = cleaned.match(/(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{2,4}))?/);
+  if (wordMatch) {
+    const day = parseInt(wordMatch[1], 10);
+    const monStr = wordMatch[2].slice(0, 3).toLowerCase();
+    if (monthMap[monStr] !== undefined) {
+      let year = wordMatch[3] ? parseInt(wordMatch[3], 10) : now.getFullYear();
+      if (year < 100) year += 2000;
+      return new Date(year, monthMap[monStr], day, hours, minutes, 0, 0).getTime();
+    }
+  }
+
+  const d = new Date(raw);
+  return !isNaN(d.getTime()) ? d.getTime() : null;
+}
+
+/**
+ * 24/7 Cloud Announcement Scanner & Telegram Alert Routine
+ */
+async function checkCloudAnnouncements(env, sessionData) {
+  const { sessionToken, courses = [] } = sessionData;
+  if (!courses || courses.length === 0) {
+    return { checked: 0, sent: 0 };
+  }
+
+  const cookieHeader = `MoodleSession=${sessionToken}`;
+  const botToken = env.TELEGRAM_BOT_TOKEN || sessionData.telegramToken;
+  const chatId = env.TELEGRAM_CHAT_ID || sessionData.telegramChatId;
+  if (!botToken || !chatId) {
+    return { checked: 0, sent: 0 };
+  }
+
+  let sentAnnouncementIds = new Set();
+  let isFirstRun = false;
+  if (env.SPECTRA_KV) {
+    const rawSent = await env.SPECTRA_KV.get("sent_announcement_ids");
+    if (rawSent) {
+      try {
+        sentAnnouncementIds = new Set(JSON.parse(rawSent));
+      } catch (_) { }
+    } else {
+      isFirstRun = true;
+    }
+  }
+
+  let sentCount = 0;
+  let checkedCourses = 0;
+
+  for (const course of courses) {
+    const courseId = typeof course === "object" ? (course.id || course.courseId) : course;
+    const courseCode = typeof course === "object" ? (course.code || courseId) : course;
+    if (!courseId) continue;
+
+    try {
+      const forumUrls = new Set();
+
+      try {
+        const indexRes = await fetch(`https://spectrum.um.edu.my/mod/forum/index.php?id=${encodeURIComponent(courseId)}`, {
+          headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+        });
+        if (indexRes.ok) {
+          const indexHtml = await indexRes.text();
+          const fMatches = indexHtml.match(/href=["']([^"']*\/mod\/forum\/view\.php\?id=\d+[^"']*)["']/gi) || [];
+          for (const m of fMatches) {
+            const urlM = m.match(/href=["']([^"']+)["']/i);
+            if (urlM) {
+              let u = urlM[1];
+              if (!u.startsWith("http")) u = `https://spectrum.um.edu.my/${u.replace(/^\//, "")}`;
+              forumUrls.add(u);
+            }
+          }
+        }
+      } catch (_) { }
+
+      if (forumUrls.size === 0) {
+        try {
+          const courseRes = await fetch(`https://spectrum.um.edu.my/course/view.php?id=${encodeURIComponent(courseId)}`, {
+            headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+          });
+          if (courseRes.ok) {
+            const courseHtml = await courseRes.text();
+            const fMatches = courseHtml.match(/href=["']([^"']*\/mod\/forum\/view\.php\?id=\d+[^"']*)["']/gi) || [];
+            for (const m of fMatches) {
+              const urlM = m.match(/href=["']([^"']+)["']/i);
+              if (urlM) {
+                let u = urlM[1];
+                if (!u.startsWith("http")) u = `https://spectrum.um.edu.my/${u.replace(/^\//, "")}`;
+                forumUrls.add(u);
+              }
+            }
+          }
+        } catch (_) { }
+      }
+
+      if (forumUrls.size === 0) continue;
+      checkedCourses++;
+
+      for (const fUrl of forumUrls) {
+        const forumRes = await fetch(fUrl, {
+          headers: { "Cookie": cookieHeader, "User-Agent": "Mozilla/5.0 Spectra-Relay/1.0" }
+        });
+        if (!forumRes.ok) continue;
+        const forumHtml = await forumRes.text();
+
+        const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+        let rowM;
+        while ((rowM = rowRegex.exec(forumHtml)) !== null) {
+          const rowHtml = rowM[1];
+          const topicMatch = rowHtml.match(/<a[^>]*href=["']([^"']*discuss\.php\?d=(\d+)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/i);
+          if (!topicMatch) continue;
+
+          const rawDiscussUrl = topicMatch[1];
+          const discussionId = topicMatch[2];
+          const rawSubject = topicMatch[3].replace(/<[^>]+>/g, "").trim();
+          if (!rawSubject) continue;
+
+          if (sentAnnouncementIds.has(discussionId)) continue;
+
+          if (isFirstRun) {
+            sentAnnouncementIds.add(discussionId);
+            continue;
+          }
+
+          const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+          const cells = [];
+          let cM;
+          while ((cM = cellRegex.exec(rowHtml)) !== null) {
+            cells.push(cM[1].replace(/<[^>]+>/g, "").trim());
+          }
+
+          const author = cells[1] || cells[2] || "Course Instructor";
+          const dateText = cells[cells.length - 1] || "Recent";
+          const fullDiscussUrl = rawDiscussUrl.startsWith("http")
+            ? rawDiscussUrl
+            : `https://spectrum.um.edu.my/${rawDiscussUrl.replace(/^\//, "")}`;
+
+          await dispatchTelegram(
+            botToken,
+            chatId,
+            `📢 <b>Spectra Announcement: ${courseCode}</b>\n` +
+            `<b>Topic:</b> ${rawSubject}\n` +
+            `<b>Author:</b> ${author} (${dateText})\n` +
+            `🔗 <a href="${fullDiscussUrl}">Read Discussion on SPeCTRUM</a>`
+          );
+
+          sentAnnouncementIds.add(discussionId);
+          sentCount++;
+        }
+      }
+    } catch (err) {
+      console.warn(`[Spectra Relay] Error checking announcements for ${courseCode}:`, err);
+    }
+  }
+
+  if (env.SPECTRA_KV && (sentCount > 0 || isFirstRun)) {
+    await env.SPECTRA_KV.put("sent_announcement_ids", JSON.stringify(Array.from(sentAnnouncementIds)));
+  }
+
+  return { checked: checkedCourses, sent: sentCount };
+}
